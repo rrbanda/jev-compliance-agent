@@ -1,461 +1,308 @@
-# Laya + Agentic AI on Red Hat OpenShift AI
+# Cross-Border Data Router
+
+A three-tier AI agent for compliance-aware data routing in regulated industries.  
+**System 1** (instant neural classification) + **System 2** (LLM reasoning) + **deterministic policy engine**.
 
 ## The Problem
 
-Financial institutions operating across borders face a constant tension: **every piece of customer data must be classified and routed to the right jurisdiction before it can be processed** — and getting it wrong means regulatory fines (GDPR: up to 4% of global revenue, CCPA: $7,500 per violation).
+Financial institutions processing data across borders face cascading regulatory requirements:
 
-Today this is typically handled by:
-- **Manual review** — slow, expensive, doesn't scale
-- **Rule-based systems** — brittle, can't handle unstructured text
-- **LLMs** — can reason about regulations, but hallucinate classifications, take seconds per request, and often require sending data to external APIs (a compliance violation in itself)
+- **GDPR (EU)**: Personal data of EU residents cannot leave the EU/EEA without adequacy decisions or binding corporate rules.  Violations carry fines up to 4% of global annual revenue.
+- **CCPA (US)**: California consumers can opt out of cross-border data sales.  Enforcement actions have reached eight-figure settlements.
+- **Conflicting obligations**: A German customer's financial records may simultaneously require EU residency (GDPR), US reporting (SEC/FATCA), and contractual restrictions that forbid certain jurisdictions entirely.
 
-None of these work well alone. What's needed is a system that is **fast** (classify data in milliseconds, not seconds), **reliable** (auditable confidence scores, not hallucinated labels), **smart** (reason about complex multi-jurisdiction rules), and **sovereign** (nothing leaves your infrastructure).
+Current approaches fail because they rely on either:
+- **Manual classification** — slow, error-prone, doesn't scale to real-time transaction volumes.
+- **LLM-only classification** — generative models hallucinate categories, produce uncalibrated confidence scores, and take seconds per request.
+
+Neither provides the **auditable probability distributions** that compliance teams need to justify routing decisions to regulators.
 
 ## The Solution
 
-This demo combines two AI systems — each doing what it's best at — into a single agentic pipeline, running entirely on [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) (RHOAI). No external API calls leave the cluster.
+This demo separates the problem into three tiers, each using the right tool:
 
-| Layer | Component | What it does | Latency |
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                  Gemini 2.5 Flash (System 2)                      │
+│          "Reason about the routing decision"                      │
+│          Google AI API — no on-cluster GPU needed                 │
+└──────────────┬──────────────────────────┬────────────────────────┘
+               │                          │
+      ┌────────▼────────┐       ┌────────▼─────────┐
+      │  Laya (Fast)    │       │ DiffusionGemma   │
+      │  System 1a      │       │ System 1b        │
+      │  421M encoder   │       │ 26B diffusion    │
+      │  CPU, ~145ms    │       │ H200 MIG, ~10-26s│
+      │  /v1/systemone  │       │ /v1/systemone    │
+      └────────┬────────┘       └────────┬─────────┘
+               │   Same Jev protocol     │
+               └──────────┬──────────────┘
+                          │
+                  ┌───────▼───────┐
+                  │ Policy Engine │
+                  │ A2A + OpenEAGO│
+                  │ Deterministic │
+                  └───────┬───────┘
+                          │
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+       EU Agent       UK Agent       US Agent
+      (Frankfurt)    (London)       (Iowa)
+```
+
+| Component | Role | Hardware | Latency |
 |---|---|---|---|
-| **System 1** — Fast Classifier | [Laya](https://github.com/convaiinnovations/laya) (421M params, GPU) | Classifies data as PII / financial / health / public with calibrated confidence scores | ~28 ms |
-| **System 2** — Reasoning LLM | Qwen 2.5 Coder 7B (vLLM) | Extracts context, infers regulatory requirements, orchestrates multi-step routing | ~2-5 s |
-| **Policy Engine** | Python rule engine | Enforces hard compliance filters — residency, jurisdiction exclusions | <1 ms |
-| **Orchestrator** | [Google ADK 2.0](https://adk.dev/) | Wires it all together as an agentic tool-calling pipeline | — |
-| **Observability** | [MLflow](https://mlflow.org/) tracing | Logs every LLM call and tool invocation for audit and debugging | — |
-
-> **Why two models?** An LLM alone takes seconds and can hallucinate a "PII" classification that's actually financial data — a routing mistake with regulatory consequences. Laya gives a reliable, auditable classification in 28ms with calibrated probabilities. The LLM then reasons about *what to do* with that classification: which regulations apply, which jurisdictions are allowed, and which processor should handle the data. **Fast where it matters, smart where it counts.**
-
----
-
-## Live Demo
-
-Two playground UIs are deployed on the cluster:
-
-| Playground | What to test | URL |
-|---|---|---|
-| **Agent** (combined) | Full pipeline: classify data → apply policy → route to jurisdiction | `https://cbdr-agent-laya-demo.apps.ocp.<cluster>/` |
-| **Laya** (standalone) | Raw System 1 classification speed and accuracy | `https://laya-playground-laya-demo.apps.ocp.<cluster>/` |
-
-**Try the Agent Playground** — type a routing request like:
-
-> *Route this data: A customer record with full name, date of birth, and national insurance number from London, UK. Required residency: UK. Excluded jurisdictions: CN, RU.*
-
-The chat UI shows every step: Laya classification (blue tool call), policy engine result (green), and the agent's final routing decision.
-
----
-
-## How It Works
-
-### Agent Pipeline
-
-```mermaid
-flowchart TD
-    User["👤 User Request\n'Route this German PII record under GDPR'"]
-    
-    subgraph ADK["Google ADK 2.0 Agent (Qwen 2.5 Coder 7B on RHOAI)"]
-        direction TB
-        Orchestrator["Orchestrator LLM\nReasoning + Tool Calling"]
-        
-        subgraph S1["Step 1 — System 1 Classification ⚡ ~28ms"]
-            LayaTool["classify_with_laya(text)"]
-            LayaGPU["Laya GPU InferenceService\n(KServe on RHOAI)"]
-            LayaResult["{ classification: PII,\n  confidence: 0.73,\n  has_pii: true }"]
-        end
-        
-        subgraph S2["Step 2 — Policy Engine ⚡ <1ms"]
-            RouteTool["evaluate_and_route(PII, EU, ...)"]
-            subgraph Filters["3-Stage Filter"]
-                F1["Residency Filter\nEU/EEA covers required EU? ✓"]
-                F2["Jurisdiction Exclusion\nUS, CN on exclude list? ✗ us_processor"]
-                F3["Scoring\neu_processor=1.0 (preferred)"]
-            end
-            RouteResult["{ decision: approved,\n  agent: eu_processor,\n  jurisdiction: EU }"]
-        end
-        
-        subgraph S3["Step 3 — Delegate to Regional Processor"]
-            EU["eu_processor\nGDPR · EU-WEST"]
-            UK["uk_processor\nUK-GDPR · UK-LONDON"]
-            US["us_processor\nCCPA · US-IOWA"]
-        end
-    end
-    
-    Result["✅ Processed in EU-WEST\nunder GDPR controls"]
-
-    User --> Orchestrator
-    Orchestrator --> LayaTool
-    LayaTool --> LayaGPU
-    LayaGPU --> LayaResult
-    LayaResult --> Orchestrator
-    Orchestrator --> RouteTool
-    RouteTool --> F1 --> F2 --> F3
-    F3 --> RouteResult
-    RouteResult --> Orchestrator
-    Orchestrator --> EU
-    EU --> Result
-
-    style S1 fill:#e8f0fe,stroke:#4285f4
-    style S2 fill:#e6f4ea,stroke:#34a853
-    style S3 fill:#fef7e0,stroke:#f9ab00
-```
-
-### Laya DecisionModel — How System 1 Actually Works
-
-Laya is not a generic classifier — it's a [Jev](https://jev.ai)-style **decision model** with a purpose-built architecture trained via reinforcement learning.
-
-```mermaid
-flowchart TD
-    subgraph Input["Input Sequence (Jev Wire Format)"]
-        direction LR
-        CLS["[CLS]"]
-        Type["&lt;type&gt;\nchoice"]
-        Inst["instructions:\n'What type of\nsensitive data?'"]
-        SEP1["[SEP]"]
-        M0["[MASK]"]
-        O0["PII"]
-        M1["[MASK]"]
-        O1["financial"]
-        M2["[MASK]"]
-        O2["public"]
-        SEP2["[SEP]"]
-        State["Customer Hans Mueller,\nBerlin. DOB: 1985-03-15.\nAccount DE8937..."]
-        SEP3["[SEP]"]
-    end
-
-    subgraph Encoder["Bidirectional Transformer Encoder (ModernBERT-large, 421M params)"]
-        ENC["Full bidirectional attention over entire sequence\n→ hidden states h[B, L, 1024]"]
-    end
-    
-    TypeEmb["+ type_emb(choice)\nEmbedding(3, d) — tells head\nwhether this is choice / score / noul"]
-    
-    subgraph Head["Decision Head (2-layer TransformerEncoder, trained params)"]
-        TF["2-layer TransformerEncoder\nwith dynamic multi-head attention"]
-    end
-    
-    subgraph Gather["Gather Hidden States at [MASK] Positions"]
-        G0["h[MASK₀] → PII"]
-        G1["h[MASK₁] → financial"]
-        G2["h[MASK₂] → public"]
-    end
-    
-    subgraph Scorer["Scorer: LayerNorm → Linear → GELU → Linear → squeeze"]
-        Logits["logits: [2.1, 0.8, -0.3]"]
-        Softmax["softmax + temperature calibration"]
-        Probs["probabilities:\nPII: 0.73, financial: 0.15, public: 0.12"]
-    end
-    
-    subgraph ActHead["Act Head: Should the model act on this answer?"]
-        Features["[CLS]_pooled ∥ top1 ∥ margin ∥ entropy ∥ k"]
-        ActMLP["Linear(d+4, 256) → GELU → Linear(256, n_act)"]
-        ActProb["act_probability: 0.97\n(high confidence → act on answer)"]
-    end
-
-    Input --> Encoder
-    Encoder --> TypeEmb --> Head
-    Head --> Gather
-    Gather --> Scorer
-    Scorer --> Logits --> Softmax --> Probs
-    Encoder --> ActHead
-    Gather --> Features --> ActMLP --> ActProb
-
-    style Input fill:#f5f5f5,stroke:#999
-    style Encoder fill:#e8f0fe,stroke:#4285f4
-    style Head fill:#d4e4fc,stroke:#4285f4
-    style Scorer fill:#e6f4ea,stroke:#34a853
-    style ActHead fill:#fef7e0,stroke:#f9ab00
-```
-
-**Key architectural choices:**
-
-- **[MASK]-marker probing (Jev protocol)** — Each option gets a `[MASK]` token. The encoder sees the question, all options, and the full state text simultaneously in a single bidirectional pass. Hidden states at `[MASK]` positions are gathered and scored — the options compete against each other.
-- **Variable options at inference time** — Unlike a fixed-class classifier, the number of options is set per request. You can ask 2 options or 20 — the architecture handles both.
-- **RL training with strictly proper scoring rules** — Trained with a reward combining log score + spherical score + ranked probability score (for ordinal questions). This incentivizes *calibrated* probability distributions — the model is penalized for over-confidence, not just wrong answers.
-- **Act head for abstention** — A separate MLP head decides whether the model should act on its answer, based on the [CLS] pooled representation + decision statistics (top-1 probability, margin, entropy). This enables confidence-gated workflows.
-- **Temperature-calibrated outputs** — Per-question-type temperatures are fitted post-training so that reported confidence scores are actually calibrated (of answers returned at confidence 0.7, about 70% are correct).
-
-### Three-stage policy engine
-
-The policy engine enforces hard compliance rules *before* any scoring. A non-compliant agent cannot out-score its way into eligibility.
-
-1. **Residency filter** — does the agent's data-residency region cover the required residency?
-2. **Jurisdiction exclusion** — is the agent's jurisdiction on the exclusion list?
-3. **Scoring** — among compliant agents, score by preference, residency coverage, and compliance tags
-
-### Agent-to-Agent protocol
-
-Each regional processor (EU, UK, US) is registered as an [A2A AgentCard](https://google.github.io/A2A/) with [OpenEAGO](https://openeago.finos.org/) geographic metadata — jurisdiction, data-residency regions, compliance tags (GDPR, CCPA, etc.). This makes routing decisions auditable and standards-based.
-
----
-
-## What's Deployed
-
-### RHOAI InferenceServices (Laya)
-
-| Component | Resource | Description |
-|---|---|---|
-| **CPU API** | `InferenceService/laya-cpu` | Laya on CPU (~145 ms), `english` + `multilingual` checkpoints |
-| **GPU API** | `InferenceService/laya-gpu` | Laya on NVIDIA A10G (~28 ms), same checkpoints |
-| **Laya Playground** | `InferenceService/laya-playground` | Interactive web UI for standalone Laya testing |
-
-All three use **custom ServingRuntimes** — the same mechanism RHOAI uses for vLLM, OVMS, and Triton.
-
-### LLM (Qwen 2.5 Coder 7B)
-
-Served by vLLM via RHOAI's MaaS gateway (`LLMInferenceService`). The agent connects through [`rh-maas-litellm`](https://github.com/rrbanda/rh-maas-litellm), an ADK LiteLlm adapter that handles the `tools + response_format` conflict that vLLM rejects.
-
-### ADK Agent
-
-A standard OpenShift `Deployment` with an OpenAI-compatible `/chat/completions` endpoint and the playground chat UI at `/`. Built as a container image via OpenShift `BuildConfig`.
-
-### MLflow Tracing (optional)
-
-When `MLFLOW_TRACKING_URI` is set, the agent automatically logs every LLM call (via LiteLLM autolog) and can trace tool invocations to an MLflow server on the cluster. If the MLflow server is unreachable or the env var is unset, the agent continues without tracing — no crash, no degradation.
-
----
-
-## Deploy It Yourself
-
-### Prerequisites
-
-- OpenShift 4.16+ with **RHOAI 3.5+** installed
-- KServe component enabled (RawDeployment mode is sufficient)
-- NVIDIA GPU Operator + at least one GPU node (for GPU variant)
-- A vLLM-served LLM accessible via MaaS gateway (or any OpenAI-compatible endpoint)
-- `oc` CLI authenticated as cluster-admin or project admin
-
-### Step 1 — Laya infrastructure
-
-```bash
-# Create namespace, storage, build images
-oc apply -f manifests/00-namespace.yaml
-oc apply -f manifests/01-pvcs.yaml
-oc apply -f manifests/02-build.yaml
-oc start-build laya --from-dir=. -n laya-demo --follow
-oc start-build laya-cuda --from-dir=. -n laya-demo --follow
-
-# Deploy ServingRuntimes, InferenceServices, Routes
-oc apply -f manifests/03-serving-runtimes.yaml
-oc apply -f manifests/04-inference-services.yaml
-oc apply -f manifests/05-routes.yaml
-
-# Verify (12-point check)
-scripts/verify.sh
-```
-
-### Step 2 — ADK agent
-
-```bash
-# Create the BuildConfig (one-time)
-oc new-build --binary --name=cbdr-agent -n laya-demo
-
-# Build the agent container image
-cd agent && oc start-build cbdr-agent --from-dir=. -n laya-demo --follow
-
-# Create the MaaS API key secret (get the key from your MaaS gateway)
-oc create secret generic maas-apikey -n laya-demo \
-  --from-literal=api_key=<your-maas-api-key>
-
-# Deploy the agent (Deployment + Service + Route)
-oc apply -f manifests/06-agent.yaml
-```
-
-The agent manifest (`06-agent.yaml`) configures:
-- `MAAS_BASE_URL` — your MaaS gateway URL
-- `MAAS_API_KEY` — pulled from the `maas-apikey` secret (never hardcoded)
-- `LAYA_API_URL` — Laya GPU endpoint (route URL)
-- `MODEL_NAME` — the vLLM model name
-
-### Step 3 — Verify
-
-```bash
-# Agent health
-curl -sk https://$(oc get route cbdr-agent -n laya-demo -o jsonpath='{.spec.host}')/health
-
-# End-to-end test
-curl -sk https://$(oc get route cbdr-agent -n laya-demo -o jsonpath='{.spec.host}')/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "cross-border-data-router",
-    "messages": [{"role": "user", "content": "Route this data: A financial transaction record with account numbers from Frankfurt, Germany. Required residency: EU. Excluded jurisdictions: US, CN."}]
-  }'
-```
-
----
-
-## Running Locally
-
-```bash
-cd agent
-cp .env.example .env          # Edit with your endpoint URLs
-pip install -e .
-adk run app                   # ADK dev server with built-in UI
-```
-
-Or run the automated demo script against live RHOAI endpoints:
-
-```bash
-scripts/agent-demo.sh         # 3 FSI scenarios with pass/fail
-```
-
----
-
-## Demo Scenarios
-
-### Scenario 1: EU PII (GDPR)
-German customer record (name, DOB, account number) → Laya classifies as **PII** → policy requires EU residency → routed to `eu_processor` (Frankfurt, GDPR controls).
-
-### Scenario 2: US Financial (CCPA)
-US bank wire transfer → Laya classifies as **financial** → policy requires US residency → routed to `us_processor` (Iowa, CCPA compliance).
-
-### Scenario 3: Cross-Border Conflict
-EU health record with *all* jurisdictions excluded → policy correctly **rejects** the request — no compliant processor available, escalates to human review.
-
----
-
-## API Reference
-
-### Laya — `/v1/systemone` (Jev wire protocol)
-
-```bash
-curl -sk -X POST \
-  https://$(oc get route laya-api-gpu -n laya-demo -o jsonpath='{.spec.host}')/v1/systemone \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "state": "Customer Hans Mueller, Berlin. DOB: 1985-03-15. Account DE89370400440532013000.",
-    "questions": {
-      "data_type": {
-        "type": "choice",
-        "instructions": "What type of sensitive data is present?",
-        "criteria": {
-          "PII": {"description": "Personal identifiable information"},
-          "financial": {"description": "Financial records or transactions"},
-          "public": {"description": "Non-sensitive public data"}
-        }
-      }
+| **Laya** | System 1a — fast neural classification.  Purpose-built encoder that outputs calibrated probability distributions.  Cannot hallucinate. | CPU (or GPU) | ~145ms |
+| **DiffusionGemma 26B** | System 1b — deep analysis.  Diffusion transformer with structured-read mode.  Denoises a fixed token canvas and reads the answer distribution. | H200 MIG 3g.71gb | ~10-26s |
+| **Gemini 2.5 Flash** | System 2 — reasoning.  Interprets the System 1 classification, applies business rules, and decides which regional agent to route to. | Google AI API | ~1-3s |
+| **Policy Engine** | Deterministic three-stage filter: data-residency → jurisdiction-exclusion → scoring.  Uses A2A Agent Cards with OpenEAGO geographic metadata. | CPU (in-process) | <1ms |
+
+### Why two System 1 engines?
+
+Both Laya and DiffusionGemma speak the **same Jev `/v1/systemone` wire protocol** — the agent calls a single tool and the backend is selected automatically:
+
+- **`auto` mode** (default): Laya classifies in ~145ms.  If confidence < 80%, DiffusionGemma is also called for a deeper read.  Both results are returned.
+- **`fast` mode**: Laya only — for latency-sensitive real-time routing.
+- **`deep` mode**: DiffusionGemma only — for audit-grade analysis.
+
+This mirrors a real operational pattern: **fast triage** for volume, **deep confirmation** for compliance evidence.
+
+## What is the Jev Protocol?
+
+Jev treats a model as a **decision function**, not a text generator.  Instead of asking "What type of data is this?" and parsing prose, Jev sends structured questions and gets back **typed answers with probabilities**:
+
+```json
+{
+  "state": "Hans Mueller, Bahnhofstrasse 42, Berlin. Account DE89370400...",
+  "questions": {
+    "data_type": {
+      "type": "choice",
+      "instructions": "What type of sensitive data is present?",
+      "options": ["PII", "financial", "health", "public"]
+    },
+    "has_pii": {
+      "type": "noul",
+      "instructions": "Does this record contain PII?"
+    },
+    "needs_human_review": {
+      "type": "noul",
+      "instructions": "Should a human compliance officer review this?"
     }
-  }'
+  }
+}
 ```
 
 Response:
 ```json
 {
-  "model": "laya-rl-agent",
   "answers": {
-    "data_type": {
-      "choice": "PII",
-      "probabilities": {"PII": 0.73, "financial": 0.15, "public": 0.12},
-      "confidence": 0.58,
-      "answer_confidence": 0.73
-    }
-  },
-  "usage": {"input_tokens": 48, "output_tokens": 0}
+    "data_type": {"choice": "PII", "probabilities": {"PII": 0.94, "financial": 0.04, "health": 0.01, "public": 0.01}},
+    "has_pii":   {"noul": 0.97},
+    "needs_human_review": {"noul": 0.23}
+  }
 }
 ```
 
-### Agent — `/chat/completions` (OpenAI-compatible)
+Three question types:
+- **`noul`** (yes/no): Returns a probability 0.0–1.0.  "Is this PII?" → 0.97.
+- **`choice`** (categorical): Returns a distribution over options.  "What type?" → {PII: 0.94, financial: 0.04, ...}.
+- **`score`** (ordered scale): Returns a distribution over levels.  "Risk tier?" → {low: 0.1, medium: 0.3, high: 0.6}.
+
+The probabilities are **calibrated** — when Laya says 0.94, the true positive rate across similar inputs is approximately 94%.  This is what regulators want: not "the AI said PII", but "the AI assigned 94% probability to PII, which exceeds our 80% routing threshold."
+
+## Architecture Details
+
+### Laya DecisionModel
+
+Laya is a 421M-parameter encoder that was purpose-built for decision tasks:
+
+```mermaid
+graph LR
+    A[Input Text] --> B[ModernBERT-large Encoder]
+    B --> C["[MASK] markers per option"]
+    C --> D[2-layer TransformerEncoder Decision Head]
+    D --> E["Scorer: LayerNorm → Linear → GELU → Linear"]
+    E --> F[Softmax → Calibrated Probabilities]
+    D --> G["Act Head: should I act on this?"]
+```
+
+Key architectural choices:
+- **MASK-marker probing**: Each answer option gets a `[MASK]` token.  The model scores all options in one bidirectional forward pass — no autoregressive generation.
+- **Variable options at inference**: The number of choices can differ between requests without retraining.
+- **RL training**: Trained with strictly proper scoring rules (log score + spherical score + ranked probability score) that incentivize calibrated distributions, not just correct labels.
+- **Act head**: A separate head that answers "should I act on this at all?" — the abstention signal.
+
+### DiffusionGemma 26B-A4B
+
+DiffusionGemma is a 26B-parameter Mixture-of-Experts diffusion transformer (4B active parameters per token):
+
+- **Structured-read mode**: vLLM pins an answer template on a fixed token canvas, denoises it in parallel, and reads the distribution at the answer slots.
+- **Multi-sample averaging**: Each answer averages over multiple noise draws for stability.
+- **Auto-sampling**: When entropy is high, additional reads are taken automatically.
+- Deployed via the upstream `structured_server.py` as a sidecar to the vLLM engine.
+
+### Policy Engine
+
+The routing policy is a deterministic three-stage filter based on the [OpenEAGO](https://openeago.finos.org/) framework:
+
+1. **Residency filter**: Eliminate any agent whose declared `data_residency_regions` doesn't cover all regions the request requires.
+2. **Jurisdiction-exclusion filter**: Eliminate any agent whose jurisdiction is on the request's excluded list.
+3. **Scoring**: Rank survivors by jurisdiction preference (70%) and compliance-tag overlap (30%).
+
+Hard filters run before scoring and **never get overridden** — a non-compliant agent cannot out-score its way into eligibility.  If nothing survives, the request is rejected outright with an escalation recommendation.
+
+Agent capabilities are declared via [A2A](https://github.com/google/A2A) `AgentCard` objects with OpenEAGO geographic metadata extensions.
+
+### Infrastructure
+
+```mermaid
+graph TB
+    subgraph "OpenShift (A10G Cluster)"
+        AGENT["ADK Agent<br/>Python + FastAPI"]
+        LAYA["Laya DecisionModel<br/>KServe InferenceService"]
+        POLICY["Policy Engine<br/>(in-process)"]
+        AGENT --> LAYA
+        AGENT --> POLICY
+    end
+    subgraph "OpenShift (H200 Cluster)"
+        DGEMMA["DiffusionGemma 26B<br/>vLLM + structured_server<br/>MIG 3g.71gb"]
+    end
+    subgraph "Google AI"
+        GEMINI["Gemini 2.5 Flash"]
+    end
+    AGENT --> DGEMMA
+    AGENT --> GEMINI
+```
+
+## Demo Scenarios
+
+### 1. EU PII — Fast Path (Laya only)
+
+> "Classify and route: Hans Mueller, Bahnhofstrasse 42, Berlin. Date of birth 1985-03-15. Tax ID DE123456789."
+
+- Laya classifies as **PII** with 94% confidence in ~145ms
+- Policy engine routes to **EU Agent** (Frankfurt) — GDPR compliant
+- No DiffusionGemma escalation needed (confidence > 80%)
+
+### 2. Ambiguous Record — Auto-Escalation
+
+> "Classify and route: Transaction ref TXN-2026-441. Amount: 5,200 EUR. Note: medical equipment purchase for patient care facility in Munich."
+
+- Laya classifies as **financial** with 72% confidence — below 80% threshold
+- DiffusionGemma is auto-called: confirms **financial** at 85%, also flags `has_pii: 0.31` and `needs_human_review: 0.67`
+- Agent notes the dual classification and routes to EU Agent with a human-review recommendation
+
+### 3. Cross-Border Conflict
+
+> "Route this record: US-based bank account statement for a German national residing in France. Contains SSN, IBAN, and tax residency declarations. Must comply with both FATCA and GDPR. Cannot be processed in China or Russia."
+
+- Laya classifies as **PII** with 91% confidence
+- Policy engine applies GDPR → requires EU residency, excludes US
+- But FATCA requires US reporting — **conflict detected**
+- Policy rejects with escalation: "No agent satisfies both EU residency and US reporting. Escalate for human review."
+
+### 4. Deep Analysis Mode
+
+> "I need a thorough compliance analysis: Patient records from Berlin hospital, including diagnoses, treatment plans, and insurance claim IDs. Use deep analysis."
+
+- Agent calls `classify_with_laya(text, backend="deep")` — explicitly requests DiffusionGemma
+- DiffusionGemma returns: `health: 0.91, PII: 0.87, needs_human_review: 0.82`
+- Agent recommends EU routing with mandatory human review (health + PII combined)
+
+## Setup
+
+### Prerequisites
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- A [Gemini API key](https://aistudio.google.com/apikey)
+- Access to Laya and DiffusionGemma endpoints (or run with `SYSTEM1_MODE=fast` for Laya only)
+
+### Local Development
 
 ```bash
-curl -sk -X POST \
-  https://$(oc get route cbdr-agent -n laya-demo -o jsonpath='{.spec.host}')/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "cross-border-data-router",
-    "stream": false,
-    "messages": [{"role": "user", "content": "Route EU PII from Germany, required residency EU, exclude US and CN"}]
-  }'
+cd agent
+cp .env.example .env
+# Edit .env — set GOOGLE_API_KEY to your Gemini key
+uv sync
+source .venv/bin/activate
+uv run adk web .   # Opens ADK playground at http://localhost:8000
 ```
 
-Supports `"stream": true` for Server-Sent Events (used by the playground UI).
+### OpenShift Deployment
 
----
+```bash
+# 1. Create secrets
+oc create secret generic gemini-apikey -n laya-demo \
+  --from-literal=api_key=<YOUR_GEMINI_KEY>
 
-## Performance
+# 2. Build the agent image
+oc new-build --binary --name=cbdr-agent -n laya-demo
+cd agent && oc start-build cbdr-agent --from-dir=. -n laya-demo --follow
 
-| Metric | CPU | GPU (A10G) |
-|---|---|---|
-| Laya classification | ~145 ms | ~28 ms |
-| Laya via Route (edge TLS) | ~284 ms | ~173 ms |
-| Full agent pipeline (Laya + Qwen + policy) | — | ~5-8 s |
-| Memory (Laya) | ~4 Gi | ~4 Gi |
-
----
-
-## Repository Structure
-
-```
-manifests/
-  00-namespace.yaml              Namespace with RHOAI dashboard labels
-  01-pvcs.yaml                   PVCs for HuggingFace model cache
-  02-build.yaml                  BuildConfigs + ImageStream (CPU & CUDA)
-  03-serving-runtimes.yaml       3 custom ServingRuntimes (CPU, GPU, Playground)
-  04-inference-services.yaml     3 KServe InferenceServices
-  05-routes.yaml                 External Routes with edge TLS
-  06-agent.yaml                  Agent Deployment + Service + Route
-
-agent/
-  main.py                        FastAPI entrypoint (OpenAI-compatible API + Playground UI)
-  Dockerfile                     UBI9 container image (uv + uvicorn)
-  app/
-    agent.py                     ADK root agent (orchestrator)
-    model.py                     Shared LLM config (rh-maas-litellm → Qwen)
-    prompt.py                    System 1+2 orchestrator prompt
-    tools/
-      laya_tool.py               classify_with_laya — calls Laya GPU
-      routing_tool.py            evaluate_and_route — calls policy engine
-    app_utils/
-      telemetry.py               MLflow tracing (graceful degradation if unavailable)
-    policy/
-      engine.py                  3-stage routing policy engine
-      cards.py                   A2A AgentCard registry (OpenEAGO metadata)
-      models.py                  Data models for routing requests/decisions
-    sub_agents/                  EU, UK, US regional processor agents
-  playground/
-    templates/index.html         Chat UI (streaming, tool-call visualization)
-  tests/                         Unit + integration tests
-  .env.example                   Endpoint configuration template
-
-scripts/
-  verify.sh                      12-point infrastructure verification
-  demo.sh                        Interactive Laya FSI demo (5 scenarios)
-  agent-demo.sh                  Agent + Laya + Qwen integration demo (3 scenarios)
+# 3. Deploy
+oc apply -f manifests/06-agent.yaml
 ```
 
----
+### DiffusionGemma on H200 MIG
 
-## RHOAI Features Demonstrated
+```bash
+# Prerequisites: booked MIG 3g.71gb slot, HuggingFace token
 
-| Feature | How It's Used |
+# 1. Create secrets
+oc create secret generic hf-token -n user-rbanda \
+  --from-literal=HF_TOKEN=<YOUR_HF_TOKEN>
+oc create configmap dgemma-structured-server -n user-rbanda \
+  --from-file=structured_server.py=manifests/structured_server.py
+
+# 2. Deploy
+oc apply -f manifests/07-diffusiongemma.yaml
+```
+
+## Project Structure
+
+```
+laya-rhoai-demo/
+├── agent/                      # ADK agent application
+│   ├── app/
+│   │   ├── agent.py            # Root agent with dual System 1 + policy tools
+│   │   ├── model.py            # Gemini model configuration
+│   │   ├── prompt.py           # Orchestrator instructions
+│   │   ├── policy/             # Deterministic routing engine
+│   │   │   ├── cards.py        # A2A Agent Cards with OpenEAGO metadata
+│   │   │   ├── engine.py       # Three-stage routing policy
+│   │   │   └── models.py       # Data shapes (DataRequest, RoutingDecision)
+│   │   ├── sub_agents/         # Regional processor agents (EU, UK, US)
+│   │   └── tools/
+│   │       ├── laya_tool.py    # Dual-backend Jev System 1 tool
+│   │       └── routing_tool.py # Policy engine tool wrapper
+│   ├── playground/             # Chat UI
+│   ├── tests/
+│   ├── Dockerfile
+│   └── pyproject.toml
+├── manifests/
+│   ├── 00-namespace.yaml       # laya-demo namespace
+│   ├── 01-pvcs.yaml            # Model storage
+│   ├── 02-build.yaml           # OpenShift BuildConfig
+│   ├── 03-serving-runtimes.yaml # KServe vLLM runtimes
+│   ├── 04-inference-services.yaml # Laya InferenceService
+│   ├── 05-routes.yaml          # External routes
+│   ├── 06-agent.yaml           # Agent Deployment + Service + Route
+│   └── 07-diffusiongemma.yaml  # DiffusionGemma on H200 MIG
+└── README.md
+```
+
+## RHOAI Features Used
+
+| Feature | How it's used |
 |---|---|
-| **KServe InferenceService** | Managed model serving with health probes, scaling, lifecycle |
-| **Custom ServingRuntime** | Laya packaged as a reusable RHOAI runtime template |
-| **RawDeployment mode** | Lightweight KServe — no Knative/Istio required |
-| **LLMInferenceService** | Qwen 2.5 Coder 7B served by vLLM via MaaS gateway |
-| **MaaS Gateway** | Unified API gateway for LLM endpoints |
-| **RHOAI Dashboard** | All resources labeled `opendatahub.io/dashboard: "true"` |
-| **GPU scheduling** | `nodeSelector` + tolerations for NVIDIA A10G nodes |
-| **OpenShift BuildConfig** | Binary Docker builds for all container images |
-| **MLflow Tracing** | Optional LLM call logging and tool-invocation tracing for audit |
-
----
-
-## Cleanup
-
-```bash
-oc delete project laya-demo
-```
-
----
-
-## Related
-
-- [Laya](https://github.com/convaiinnovations/laya) — on-device decision engine
-- [Jev](https://jev.ai) — wire protocol Laya speaks
-- [rh-maas-litellm](https://github.com/rrbanda/rh-maas-litellm) — ADK LiteLlm adapter for Red Hat MaaS
-- [Google ADK](https://adk.dev/) — Agent Development Kit 2.0
-- [A2A Protocol](https://google.github.io/A2A/) — Agent-to-Agent communication
-- [OpenEAGO](https://openeago.finos.org/) — geographic/compliance metadata for A2A
-- [Agentic Starter Kits](https://github.com/red-hat-data-services/agentic-starter-kits) — Red Hat ADK deployment templates
-- [RHOAI docs: Custom ServingRuntimes](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/configuring_your_model-serving_platform/configuring_model_servers)
+| **KServe InferenceService** | Serves Laya DecisionModel with RawDeployment mode and custom ServingRuntime |
+| **NVIDIA GPU Operator** | Manages A10G GPUs for Laya inference |
+| **MIG Partitioning** | H200 MIG 3g.71gb slice for DiffusionGemma |
+| **Kueue** | GPU workload admission with booking-based quotas |
+| **OpenShift BuildConfig** | Binary Docker builds for the agent container |
+| **Routes** | TLS-terminated external access to all endpoints |
 
 ## License
 
-Demo manifests and agent code: Apache-2.0. Laya itself is licensed under its own terms — see the [Laya repository](https://github.com/convaiinnovations/laya).
+Apache 2.0 — see [LICENSE](LICENSE).

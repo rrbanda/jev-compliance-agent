@@ -1,47 +1,28 @@
 """Shared LLM model configuration for all agents.
 
-Uses ``rh-maas-litellm`` — a Google ADK LiteLlm adapter for Red Hat MaaS
-endpoints — to connect to the Qwen 2.5 Coder 7B vLLM instance on RHOAI.
-The adapter overrides ``LlmCapabilities(output_schema_and_tools=False)``
-so ADK never sends ``tools`` and ``response_format`` in the same request
-(which vLLM / MaaS rejects with HTTP 400).
+Uses Gemini via the Google AI API as the System 2 reasoning LLM.  This
+frees all on-cluster GPUs for inference workloads (Laya, DiffusionGemma)
+and gives the agent a stronger reasoning model than a local 7B.
 
 Configure via environment variables (see .env.example):
-  MAAS_BASE_URL, MAAS_API_KEY, MAAS_URL_PATH, MODEL_NAME
+  GOOGLE_API_KEY   — Gemini API key (required)
+  MODEL_NAME       — model name (default: gemini-2.5-flash)
 """
 
 from __future__ import annotations
 
 import os
 
+from google.adk.models import Gemini
 
-def get_model():
-    """Returns a MaaSLiteLlm instance for the on-cluster vLLM endpoint.
 
-    Import is deferred so that unit tests for the policy engine can run
-    without ``litellm`` / ``rh-maas-litellm`` installed.
+def get_model() -> Gemini:
+    """Returns a Gemini model instance for the agent.
+
+    The API key is read from the GOOGLE_API_KEY environment variable.
+    This is the System 2 (slow, deliberative) half of the pipeline —
+    it reasons about the routing decision after the System 1 engines
+    (Laya / DiffusionGemma) have provided their classifications.
     """
-    from rh_maas_litellm import MaaSConfig, MaaSLiteLlm, bootstrap
-
-    bootstrap(ssl_verify=False)
-
-    model_name = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct")
-    cfg = MaaSConfig(
-        base_url=os.getenv(
-            "MAAS_BASE_URL",
-            "https://maas.apps.ocp.qn6c5.sandbox1388.opentlc.com",
-        ),
-        api_key=os.getenv("MAAS_API_KEY", "unused"),
-        url_path=os.getenv(
-            "MAAS_URL_PATH",
-            "/private-assistant-ai-serving/qwen25-coder-7b/v1",
-        ),
-        ssl_verify=False,
-    )
-
-    return MaaSLiteLlm(
-        model=f"openai/{model_name}",
-        api_base=cfg.api_base(model_name),
-        api_key=cfg.api_key,
-        drop_params=True,
-    )
+    model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+    return Gemini(model=model_name)

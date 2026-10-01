@@ -1,14 +1,20 @@
-# Cross-Border Data Router Agent — Deployment on RHOAI
+# Cross-Border Data Router Agent — Deployment on OpenShift
 #
-# Deploys the ADK agent as a standard Deployment + Service + Route.
-# The agent calls Laya GPU and Qwen vLLM endpoints on the same cluster.
+# Three-tier architecture:
+#   System 1a: Laya (fast, CPU, ~145ms)
+#   System 1b: DiffusionGemma 26B (deep, H200 MIG, ~10-26s)
+#   System 2:  Gemini (reasoning LLM, hosted API)
 #
 # Prerequisites:
-#   1. Build and push the agent image:
+#   1. Create the Gemini API key secret:
+#      oc create secret generic gemini-apikey -n laya-demo \
+#        --from-literal=api_key=<YOUR_GEMINI_KEY>
+#
+#   2. Build and push the agent image:
 #      oc new-build --binary --name=cbdr-agent -n laya-demo
 #      cd agent && oc start-build cbdr-agent --from-dir=. -n laya-demo --follow
 #
-#   2. Apply this manifest:
+#   3. Apply this manifest:
 #      oc apply -f manifests/06-agent.yaml
 ---
 apiVersion: apps/v1
@@ -36,24 +42,26 @@ spec:
             - containerPort: 8080
               protocol: TCP
           env:
-            # Qwen 2.5 Coder 7B on RHOAI (via rh-maas-litellm)
-            - name: MAAS_BASE_URL
-              value: "https://maas.apps.ocp.qn6c5.sandbox1388.opentlc.com"
-            - name: MAAS_URL_PATH
-              value: "/private-assistant-ai-serving/qwen25-coder-7b/v1"
-            - name: MAAS_API_KEY
+            # Gemini (System 2 — reasoning LLM)
+            - name: GOOGLE_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: maas-apikey
+                  name: gemini-apikey
                   key: api_key
-            - name: MAAS_SSL_VERIFY
-              value: "false"
             - name: MODEL_NAME
-              value: "Qwen/Qwen2.5-Coder-7B-Instruct"
-            # Laya GPU InferenceService (in-cluster URL)
+              value: "gemini-2.5-flash"
+            # Laya (System 1a — fast decision engine)
             - name: LAYA_API_URL
               value: "https://laya-api-gpu-laya-demo.apps.ocp.qn6c5.sandbox1388.opentlc.com"
-            # MLflow Tracing (set URI to enable; leave empty to disable)
+            # DiffusionGemma (System 1b — deep decision engine)
+            - name: DIFFUSIONGEMMA_API_URL
+              value: "https://dgemma-jev-user-rbanda.apps.ocp.cloud.rhai-tmm.dev"
+            # System 1 routing: auto = Laya first, escalate if low confidence
+            - name: SYSTEM1_MODE
+              value: "auto"
+            - name: SYSTEM1_CONFIDENCE_THRESHOLD
+              value: "0.80"
+            # MLflow Tracing (set URI to enable; leave commented to disable)
             # - name: MLFLOW_TRACKING_URI
             #   value: "https://mlflow-laya-demo.apps.ocp.<cluster>"
             # - name: MLFLOW_TRACKING_INSECURE_TLS

@@ -1,0 +1,239 @@
+# DiffusionGemma 26B-A4B on H200 MIG 3g.71gb
+# Cluster: api.ocp.cloud.rhai-tmm.dev (IBM Cloud, H200 with MIG)
+# Namespace: user-rbanda
+#
+# Based on Doug's H100 smoke test:
+#   https://gist.github.com/dougbtv/14b2a904a51fb1ede511ce7599f4f9a8
+#
+# Prerequisites:
+#   1. Book a MIG 3g.71gb slot on the GPU booking system
+#   2. Create HF token secret:
+#      oc create secret generic hf-token -n user-rbanda \
+#        --from-literal=HF_TOKEN=hf_xxxYOUR_TOKEN_HERExxx
+#   3. Create the structured_server.py ConfigMap:
+#      oc create configmap dgemma-structured-server -n user-rbanda \
+#        --from-file=structured_server.py=manifests/structured_server.py
+#   4. Apply this manifest:
+#      oc apply -f manifests/07-diffusiongemma.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dgemma-model-cache
+  namespace: user-rbanda
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 60Gi
+  storageClassName: ibmc-vpc-block-10iops-tier
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diffusiongemma-jev
+  namespace: user-rbanda
+  labels:
+    app: diffusiongemma-jev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: diffusiongemma-jev
+  template:
+    metadata:
+      labels:
+        app: diffusiongemma-jev
+        kueue.x-k8s.io/queue-name: reserved
+    spec:
+      # vLLM needs shared memory for NCCL / tensor ops
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: dgemma-model-cache
+        - name: structured-server
+          configMap:
+            name: dgemma-structured-server
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      containers:
+        # ── Container 1: vLLM engine ──────────────────────────────
+        - name: vllm-engine
+          image: quay.io/vllm/rhaiis-early-access:diffusiongemma-jev
+          ports:
+            - containerPort: 8000
+              name: vllm
+              protocol: TCP
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRANSFORMERS_CACHE
+              value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: "0"
+            - name: TRANSFORMERS_OFFLINE
+              value: "0"
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+          args:
+            - "--model"
+            - "RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic"
+            - "--served-model-name"
+            - "dgemma"
+            - "--diffusion-config"
+            - '{"canvas_length":64}'
+            - "--max-logprobs"
+            - "32"
+            - "--enable-prefix-caching"
+            - "--max-num-seqs"
+            - "4"
+            - "--gpu-memory-utilization"
+            - "0.85"
+            - "--enforce-eager"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              nvidia.com/mig-3g.71gb: 1
+              cpu: "8"
+              memory: 32Gi
+            requests:
+              nvidia.com/mig-3g.71gb: 1
+              cpu: "4"
+              memory: 16Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            timeoutSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 60
+            timeoutSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 40
+            timeoutSeconds: 10
+
+        # ── Container 2: Jev structured decision server ───────────
+        # Provides /v1/systemone on port 8011
+        # Waits for vLLM engine to be healthy before starting
+        - name: jev-server
+          image: quay.io/vllm/rhaiis-early-access:diffusiongemma-jev
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "Waiting for vLLM engine to be ready..."
+              until curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; do
+                echo "  vLLM not ready yet, sleeping 15s..."
+                sleep 15
+              done
+              echo "vLLM is ready."
+              # Auto-discover the model snapshot path
+              MODEL_DIR="/model-cache/hub/models--RedHatAI--diffusiongemma-26B-A4B-it-FP8-dynamic"
+              SNAPSHOT=$(ls -1t "$MODEL_DIR/snapshots/" 2>/dev/null | head -1)
+              TOKENIZER_PATH="$MODEL_DIR/snapshots/$SNAPSHOT"
+              if [ ! -d "$TOKENIZER_PATH" ]; then
+                # Fallback: let transformers resolve it by name
+                TOKENIZER_PATH="RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic"
+              fi
+              echo "Using tokenizer: $TOKENIZER_PATH"
+              exec python3 /opt/structured_server.py \
+                --upstream http://127.0.0.1:8000 \
+                --tokenizer "$TOKENIZER_PATH" \
+                --canvas 64 \
+                --port 8011
+          ports:
+            - containerPort: 8011
+              name: jev
+              protocol: TCP
+          env:
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRANSFORMERS_CACHE
+              value: /model-cache
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+            - name: structured-server
+              mountPath: /opt/structured_server.py
+              subPath: structured_server.py
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8011
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diffusiongemma-jev
+  namespace: user-rbanda
+  labels:
+    app: diffusiongemma-jev
+spec:
+  selector:
+    app: diffusiongemma-jev
+  ports:
+    - name: vllm
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: jev
+      port: 8011
+      targetPort: 8011
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: dgemma-jev
+  namespace: user-rbanda
+  labels:
+    app: diffusiongemma-jev
+spec:
+  to:
+    kind: Service
+    name: diffusiongemma-jev
+  port:
+    targetPort: jev
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
