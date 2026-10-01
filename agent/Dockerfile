@@ -26,7 +26,7 @@ COPY pyproject.toml ./
 
 # Install from pyproject.toml
 COPY app/ ./app/
-RUN uv pip install --python /opt/app-root/bin/python3 --no-cache "."
+RUN uv pip install --python /opt/app-root/bin/python3 --no-cache ".[tracing]"
 
 # Copy the entrypoint and playground UI
 COPY main.py .

@@ -17,6 +17,7 @@ from os import getenv
 from pathlib import Path
 
 from app.agent import create_agent
+from app.app_utils.telemetry import enable_tracing
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from google.adk.runners import Runner
@@ -46,6 +47,7 @@ class ChatCompletionRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global runner
+    enable_tracing()
     agent = create_agent()
     session_service = InMemorySessionService()
     runner = Runner(

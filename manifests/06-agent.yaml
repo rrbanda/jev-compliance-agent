@@ -53,6 +53,13 @@ spec:
             # Laya GPU InferenceService (in-cluster URL)
             - name: LAYA_API_URL
               value: "https://laya-api-gpu-laya-demo.apps.ocp.qn6c5.sandbox1388.opentlc.com"
+            # MLflow Tracing (set URI to enable; leave empty to disable)
+            # - name: MLFLOW_TRACKING_URI
+            #   value: "https://mlflow-laya-demo.apps.ocp.<cluster>"
+            # - name: MLFLOW_TRACKING_INSECURE_TLS
+            #   value: "true"
+            # - name: MLFLOW_EXPERIMENT_NAME
+            #   value: "cross-border-data-router"
             # FastAPI
             - name: PORT
               value: "8080"
