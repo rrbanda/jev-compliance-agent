@@ -1,0 +1,66 @@
+# CPU API Route
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: laya-api-cpu
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+    serving.kserve.io/inferenceservice: laya-cpu
+  annotations:
+    openshift.io/display-name: "Laya CPU API"
+spec:
+  to:
+    kind: Service
+    name: laya-cpu-predictor
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+# GPU API Route
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: laya-api-gpu
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+    serving.kserve.io/inferenceservice: laya-gpu
+  annotations:
+    openshift.io/display-name: "Laya GPU API"
+spec:
+  to:
+    kind: Service
+    name: laya-gpu-predictor
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+# Playground Route
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: laya-playground
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+    serving.kserve.io/inferenceservice: laya-playground
+spec:
+  to:
+    kind: Service
+    name: laya-playground-predictor
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

@@ -1,0 +1,110 @@
+# CPU InferenceService
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: laya-cpu
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+    app.kubernetes.io/name: laya-cpu
+    app.kubernetes.io/part-of: laya-demo
+  annotations:
+    openshift.io/display-name: "Laya Decision Engine (CPU)"
+    serving.kserve.io/deploymentMode: RawDeployment
+    security.opendatahub.io/enable-auth: "false"
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 1
+    model:
+      modelFormat:
+        name: laya-system1
+      name: ""
+      runtime: laya-cpu-runtime
+      resources:
+        requests:
+          cpu: "2"
+          memory: 4Gi
+        limits:
+          cpu: "4"
+          memory: 6Gi
+    volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: laya-model-cache
+---
+# GPU InferenceService
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: laya-gpu
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+    app.kubernetes.io/name: laya-gpu
+    app.kubernetes.io/part-of: laya-demo
+  annotations:
+    openshift.io/display-name: "Laya Decision Engine (GPU — NVIDIA A10G)"
+    serving.kserve.io/deploymentMode: RawDeployment
+    security.opendatahub.io/enable-auth: "false"
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 1
+    model:
+      modelFormat:
+        name: laya-system1-gpu
+      name: ""
+      runtime: laya-gpu-runtime
+      resources:
+        requests:
+          cpu: "2"
+          memory: 4Gi
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "4"
+          memory: 8Gi
+          nvidia.com/gpu: "1"
+    nodeSelector:
+      nvidia.com/gpu.product: NVIDIA-A10G
+    tolerations:
+      - effect: NoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+    volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: laya-gpu-cache
+---
+# Playground InferenceService
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: laya-playground
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: "Laya Interactive Playground"
+    serving.kserve.io/deploymentMode: RawDeployment
+    security.opendatahub.io/enable-auth: "false"
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 1
+    model:
+      modelFormat:
+        name: laya-playground
+      name: ""
+      runtime: laya-playground-runtime
+      resources:
+        requests:
+          cpu: "1"
+          memory: 4Gi
+        limits:
+          cpu: "2"
+          memory: 6Gi
+    volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: laya-playground-cache

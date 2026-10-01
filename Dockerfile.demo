@@ -1,0 +1,59 @@
+# Laya demo image — adds the interactive playground server to the standard build.
+# Everything else is identical to the upstream Dockerfile.
+
+ARG PYTHON_IMAGE=python:3.11-slim-bookworm
+
+FROM ${PYTHON_IMAGE} AS build
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+ARG TORCH_INDEX=cpu
+ARG TORCH_VERSION=2.14.0
+COPY docker/check_torch.py /opt/check_torch.py
+RUN pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/${TORCH_INDEX} \
+    && python /opt/check_torch.py "${TORCH_INDEX}" \
+    && pip check
+
+WORKDIR /src
+COPY pyproject.toml setup.py README.md LICENSE ./
+COPY laya/ ./laya/
+RUN pip install ".[serve]" && pip check
+
+FROM ${PYTHON_IMAGE} AS runtime
+
+LABEL org.opencontainers.image.title="Laya Demo (OpenShift)" \
+      org.opencontainers.image.source="https://github.com/rrbanda/laya" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    TORCH_DISABLE_NATIVE_JIT=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    USE_TF=0 \
+    USE_TORCH=1 \
+    TOKENIZERS_PARALLELISM=false \
+    OMP_NUM_THREADS=4 \
+    LAYA_DEVICE=cpu \
+    HF_HOME=/home/laya/.cache/huggingface
+
+RUN groupadd --gid 10001 laya \
+    && useradd --uid 10001 --gid laya --create-home laya \
+    && mkdir -p /home/laya/.cache/huggingface \
+    && chown -R laya:laya /home/laya/.cache
+
+COPY --from=build /opt/venv /opt/venv
+COPY LICENSE /usr/share/doc/laya/LICENSE
+COPY examples/docker/ /opt/laya/examples/
+COPY docker/entrypoint.py /opt/laya/entrypoint.py
+# Include the interactive playground server for the demo.
+COPY examples/server.py /opt/laya/playground/server.py
+
+USER laya
+WORKDIR /home/laya
+
+ENTRYPOINT ["python", "/opt/laya/entrypoint.py"]
+CMD ["laya-serve"]

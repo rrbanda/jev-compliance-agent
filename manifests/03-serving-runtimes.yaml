@@ -1,0 +1,118 @@
+# CPU ServingRuntime — Laya decision engine on CPU
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: laya-cpu-runtime
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: "Laya System 1 Decision Engine (CPU)"
+spec:
+  annotations:
+    prometheus.io/path: /health
+    prometheus.io/port: "8000"
+  containers:
+    - name: kserve-container
+      image: image-registry.openshift-image-registry.svc:5000/laya-demo/laya:v0.3.22
+      command: ["python", "/opt/laya/entrypoint.py"]
+      args: ["laya-serve"]
+      ports:
+        - containerPort: 8000
+          protocol: TCP
+      env:
+        - name: LAYA_HOST
+          value: "0.0.0.0"
+        - name: LAYA_PORT
+          value: "8000"
+        - name: LAYA_PRELOAD
+          value: "1"
+        - name: LAYA_MODELS
+          value: "english,multilingual"
+        - name: LAYA_DEVICE
+          value: "cpu"
+        - name: LAYA_LOG_LEVEL
+          value: "info"
+        - name: OMP_NUM_THREADS
+          value: "4"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /home/laya/.cache/huggingface
+  multiModel: false
+  supportedModelFormats:
+    - name: laya-system1
+      autoSelect: true
+---
+# GPU ServingRuntime — Laya decision engine on NVIDIA GPU
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: laya-gpu-runtime
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: "Laya System 1 Decision Engine (GPU)"
+    opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
+spec:
+  annotations:
+    prometheus.io/path: /health
+    prometheus.io/port: "8000"
+  containers:
+    - name: kserve-container
+      image: image-registry.openshift-image-registry.svc:5000/laya-demo/laya:v0.3.22-cuda
+      command: ["python", "/opt/laya/entrypoint.py"]
+      args: ["laya-serve"]
+      ports:
+        - containerPort: 8000
+          protocol: TCP
+      env:
+        - name: LAYA_HOST
+          value: "0.0.0.0"
+        - name: LAYA_PORT
+          value: "8000"
+        - name: LAYA_PRELOAD
+          value: "1"
+        - name: LAYA_MODELS
+          value: "english,multilingual"
+        - name: LAYA_DEVICE
+          value: "cuda"
+        - name: LAYA_LOG_LEVEL
+          value: "info"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /home/laya/.cache/huggingface
+  multiModel: false
+  supportedModelFormats:
+    - name: laya-system1-gpu
+      autoSelect: true
+---
+# Playground ServingRuntime — Interactive web UI
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: laya-playground-runtime
+  namespace: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: "Laya Interactive Playground"
+spec:
+  containers:
+    - name: kserve-container
+      image: image-registry.openshift-image-registry.svc:5000/laya-demo/laya:v0.3.22
+      command: ["python", "/opt/laya/playground/server.py"]
+      args: ["--host", "0.0.0.0", "--port", "8000"]
+      ports:
+        - containerPort: 8000
+          protocol: TCP
+      env:
+        - name: LAYA_LOG_LEVEL
+          value: "info"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /home/laya/.cache/huggingface
+  multiModel: false
+  supportedModelFormats:
+    - name: laya-playground
+      autoSelect: true

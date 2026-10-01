@@ -1,0 +1,78 @@
+# ImageStream to store built images
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: laya
+  namespace: laya-demo
+  labels:
+    app.kubernetes.io/part-of: laya-demo
+---
+# CPU build — binary Docker strategy using Dockerfile.demo
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: laya
+  namespace: laya-demo
+  labels:
+    app.kubernetes.io/part-of: laya-demo
+  annotations:
+    openshift.io/display-name: "Laya (CPU)"
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: laya:v0.3.22
+  source:
+    type: Binary
+    dockerfile: ""
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile.demo
+      buildArgs:
+        - name: TORCH_INDEX
+          value: cpu
+        - name: TORCH_VERSION
+          value: "2.14.0"
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+---
+# CUDA build — same Dockerfile, different torch index
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: laya-cuda
+  namespace: laya-demo
+  labels:
+    app.kubernetes.io/part-of: laya-demo
+  annotations:
+    openshift.io/display-name: "Laya (CUDA)"
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: laya:v0.3.22-cuda
+  source:
+    type: Binary
+    dockerfile: ""
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile.demo
+      buildArgs:
+        - name: TORCH_INDEX
+          value: cu126
+        - name: TORCH_VERSION
+          value: "2.14.0"
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi

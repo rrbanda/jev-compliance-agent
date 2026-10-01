@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: laya-demo
+  labels:
+    opendatahub.io/dashboard: "true"
+    kubernetes.io/metadata.name: laya-demo
+  annotations:
+    openshift.io/display-name: "Laya System 1 Demo"
+    openshift.io/description: >-
+      Laya decision engine deployed as KServe InferenceServices
+      with custom ServingRuntimes on Red Hat OpenShift AI.
