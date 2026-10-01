@@ -1,158 +1,247 @@
-# Laya on Red Hat OpenShift AI
+# Laya + Agentic AI on Red Hat OpenShift AI
 
-Deploy [Laya](https://github.com/convaiinnovations/laya), a fast on-device **System 1 decision engine** (421M params, ~28 ms on GPU), as a [KServe](https://kserve.github.io/website/) `InferenceService` on [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) (RHOAI) 3.5+.
+A production-ready demo of **System 1 + System 2 AI** for regulated cross-border data routing — entirely on [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) (RHOAI). No external API calls leave the cluster.
 
-> **TL;DR** — Three custom `ServingRuntime` definitions, three `InferenceService` deployments, edge-TLS routes, GPU scheduling, and RHOAI dashboard integration — all from `oc apply`.
+| Layer | Component | Role | Latency |
+|---|---|---|---|
+| **System 1** | [Laya](https://github.com/convaiinnovations/laya) (421M params, GPU) | Fast neural data classifier | ~28 ms |
+| **System 2** | Qwen 2.5 Coder 7B (vLLM) | Reasoning, tool-calling, orchestration | ~2-5 s |
+| **Policy** | Python rule engine | Hard compliance filters (residency, jurisdiction) | <1 ms |
+| **Agent** | [Google ADK 2.0](https://adk.dev/) | Orchestrates the pipeline end-to-end | — |
 
----
-
-## What Is Laya?
-
-Laya is an open-source, on-device decision model that answers **typed questions** — yes/no, multiple choice, scored — in a single forward pass. It speaks the [Jev](https://jev.ai) `/v1/systemone` wire protocol, so any Jev client can point at Laya and keep working unchanged.
-
-| Metric | Value |
-|---|---|
-| Parameters | 421 M |
-| GPU latency (A10G) | ~28 ms |
-| CPU latency | ~145 ms |
-| Checkpoints | `english`, `multilingual`, `typed-decisions` |
-| Protocol | Jev `/v1/systemone` (REST) |
+> **Why both?** An LLM alone takes seconds and can hallucinate classifications. Laya gives a reliable, auditable classification in 28ms — the LLM then reasons about *what to do* with that classification. Fast where it matters, smart where it counts.
 
 ---
 
-## What This Deploys
+## Live Demo
 
-| Component | KServe Resource | Description |
+Two playground UIs are deployed on the cluster:
+
+| Playground | What to test | URL |
 |---|---|---|
-| **CPU API** | `InferenceService/laya-cpu` | Decision API on CPU (~145 ms) |
-| **GPU API** | `InferenceService/laya-gpu` | Decision API on NVIDIA A10G GPU (~28 ms) |
-| **Playground** | `InferenceService/laya-playground` | Interactive web UI for trying decisions |
+| **Agent** (combined) | Full pipeline: classify data → apply policy → route to jurisdiction | `https://cbdr-agent-laya-demo.apps.ocp.<cluster>/` |
+| **Laya** (standalone) | Raw System 1 classification speed and accuracy | `https://laya-playground-laya-demo.apps.ocp.<cluster>/` |
 
-Each uses a **custom `ServingRuntime`** — the same mechanism RHOAI uses for vLLM, OVMS, and Triton — but with Laya's own model server.
+**Try the Agent Playground** — type a routing request like:
+
+> *Route this data: A customer record with full name, date of birth, and national insurance number from London, UK. Required residency: UK. Excluded jurisdictions: CN, RU.*
+
+The chat UI shows every step: Laya classification (blue tool call), policy engine result (green), and the agent's final routing decision.
 
 ---
 
-## Architecture
+## How It Works
 
 ```
-┌── RHOAI Cluster (OpenShift 4.16+, RHOAI 3.5+) ──────────┐
-│                                                            │
-│  ServingRuntime: laya-cpu-runtime                          │
-│  └─ InferenceService: laya-cpu  ──→ Route (edge TLS)      │
-│     └─ Pod: kserve-container · kube-rbac-proxy · agent     │
-│                                                            │
-│  ServingRuntime: laya-gpu-runtime                          │
-│  └─ InferenceService: laya-gpu  ──→ Route (edge TLS)      │
-│     └─ Pod: kserve-container · kube-rbac-proxy · agent     │
-│        └─ nvidia.com/gpu: 1  (NVIDIA A10G)                 │
-│                                                            │
-│  ServingRuntime: laya-playground-runtime                   │
-│  └─ InferenceService: laya-playground ──→ Route            │
-│     └─ Pod: kserve-container · kube-rbac-proxy · agent     │
-│                                                            │
-│  Storage: 3 × PVC (10 Gi, HuggingFace model cache)        │
-│  Images:  BuildConfig → ImageStream (CPU + CUDA)           │
-└────────────────────────────────────────────────────────────┘
+  User: "Route this German PII record under GDPR"
+    │
+    ▼
+┌── ADK Agent (Qwen 2.5 on RHOAI) ────────────────────────┐
+│                                                           │
+│  Step 1: classify_with_laya(text)          ⚡ ~28ms       │
+│          → Laya GPU: "PII, 73% confidence"               │
+│                                                           │
+│  Step 2: evaluate_and_route(...)           ⚡ <1ms        │
+│          → Policy engine filters:                        │
+│            ✓ eu_processor — residency EU/EEA covers EU   │
+│            ✓ uk_processor — residency UK/EU covers EU    │
+│            ✗ us_processor — residency US, no EU coverage │
+│          → Scores: eu_processor=1.0 (preferred)          │
+│                                                           │
+│  Step 3: Delegate to eu_processor                        │
+│          → "Processed in EU-WEST under GDPR controls"    │
+└───────────────────────────────────────────────────────────┘
 ```
 
----
+### Three-stage policy engine
 
-## RHOAI Features Demonstrated
+The policy engine enforces hard compliance rules *before* any scoring. A non-compliant agent cannot out-score its way into eligibility.
 
-| Feature | How It's Used |
-|---|---|
-| **KServe InferenceService** | Managed model serving with health probes, HPA, lifecycle |
-| **Custom ServingRuntime** | Laya's Python server packaged as a reusable runtime template |
-| **RawDeployment mode** | Lightweight KServe — no Knative/Istio dependency |
-| **RHOAI Dashboard** | All resources labeled `opendatahub.io/dashboard: "true"` |
-| **Auto-injected sidecars** | `kube-rbac-proxy` + `kserve-agent` added to every pod |
-| **GPU scheduling** | `nodeSelector` + tolerations for NVIDIA A10G nodes |
-| **OpenShift BuildConfig** | Binary Docker builds for CPU and CUDA images |
+1. **Residency filter** — does the agent's data-residency region cover the required residency?
+2. **Jurisdiction exclusion** — is the agent's jurisdiction on the exclusion list?
+3. **Scoring** — among compliant agents, score by preference, residency coverage, and compliance tags
+
+### Agent-to-Agent protocol
+
+Each regional processor (EU, UK, US) is registered as an [A2A AgentCard](https://google.github.io/A2A/) with [OpenEAGO](https://openeago.finos.org/) geographic metadata — jurisdiction, data-residency regions, compliance tags (GDPR, CCPA, etc.). This makes routing decisions auditable and standards-based.
 
 ---
 
-## Prerequisites
+## What's Deployed
+
+### RHOAI InferenceServices (Laya)
+
+| Component | Resource | Description |
+|---|---|---|
+| **CPU API** | `InferenceService/laya-cpu` | Laya on CPU (~145 ms), `english` + `multilingual` checkpoints |
+| **GPU API** | `InferenceService/laya-gpu` | Laya on NVIDIA A10G (~28 ms), same checkpoints |
+| **Laya Playground** | `InferenceService/laya-playground` | Interactive web UI for standalone Laya testing |
+
+All three use **custom ServingRuntimes** — the same mechanism RHOAI uses for vLLM, OVMS, and Triton.
+
+### LLM (Qwen 2.5 Coder 7B)
+
+Served by vLLM via RHOAI's MaaS gateway (`LLMInferenceService`). The agent connects through [`rh-maas-litellm`](https://github.com/rrbanda/rh-maas-litellm), an ADK LiteLlm adapter that handles the `tools + response_format` conflict that vLLM rejects.
+
+### ADK Agent
+
+A standard OpenShift `Deployment` with an OpenAI-compatible `/chat/completions` endpoint and the playground chat UI at `/`. Built as a container image via OpenShift `BuildConfig`.
+
+---
+
+## Deploy It Yourself
+
+### Prerequisites
 
 - OpenShift 4.16+ with **RHOAI 3.5+** installed
 - KServe component enabled (RawDeployment mode is sufficient)
-- NVIDIA GPU Operator + at least one GPU node (for the GPU variant)
+- NVIDIA GPU Operator + at least one GPU node (for GPU variant)
+- A vLLM-served LLM accessible via MaaS gateway (or any OpenAI-compatible endpoint)
 - `oc` CLI authenticated as cluster-admin or project admin
 
----
-
-## Quick Start
+### Step 1 — Laya infrastructure
 
 ```bash
-# 1. Create namespace and storage
+# Create namespace, storage, build images
 oc apply -f manifests/00-namespace.yaml
 oc apply -f manifests/01-pvcs.yaml
-
-# 2. Build container images (run from the Laya source checkout)
 oc apply -f manifests/02-build.yaml
 oc start-build laya --from-dir=. -n laya-demo --follow
 oc start-build laya-cuda --from-dir=. -n laya-demo --follow
 
-# 3. Deploy ServingRuntimes + InferenceServices
+# Deploy ServingRuntimes, InferenceServices, Routes
 oc apply -f manifests/03-serving-runtimes.yaml
 oc apply -f manifests/04-inference-services.yaml
-
-# 4. Expose via Routes
 oc apply -f manifests/05-routes.yaml
 
-# 5. Verify (12-point check)
+# Verify (12-point check)
 scripts/verify.sh
+```
+
+### Step 2 — ADK agent
+
+```bash
+# Create the BuildConfig (one-time)
+oc new-build --binary --name=cbdr-agent -n laya-demo
+
+# Build the agent container image
+cd agent && oc start-build cbdr-agent --from-dir=. -n laya-demo --follow
+
+# Create the MaaS API key secret (get the key from your MaaS gateway)
+oc create secret generic maas-apikey -n laya-demo \
+  --from-literal=api_key=<your-maas-api-key>
+
+# Deploy the agent (Deployment + Service + Route)
+oc apply -f manifests/06-agent.yaml
+```
+
+The agent manifest (`06-agent.yaml`) configures:
+- `MAAS_BASE_URL` — your MaaS gateway URL
+- `MAAS_API_KEY` — pulled from the `maas-apikey` secret (never hardcoded)
+- `LAYA_API_URL` — Laya GPU endpoint (route URL)
+- `MODEL_NAME` — the vLLM model name
+
+### Step 3 — Verify
+
+```bash
+# Agent health
+curl -sk https://$(oc get route cbdr-agent -n laya-demo -o jsonpath='{.spec.host}')/health
+
+# End-to-end test
+curl -sk https://$(oc get route cbdr-agent -n laya-demo -o jsonpath='{.spec.host}')/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "cross-border-data-router",
+    "messages": [{"role": "user", "content": "Route this data: A financial transaction record with account numbers from Frankfurt, Germany. Required residency: EU. Excluded jurisdictions: US, CN."}]
+  }'
 ```
 
 ---
 
-## API Usage
-
-### Health check
+## Running Locally
 
 ```bash
-curl -sk https://$(oc get route laya-api-gpu -n laya-demo -o jsonpath='{.spec.host}')/health
+cd agent
+cp .env.example .env          # Edit with your endpoint URLs
+pip install -e .
+adk run app                   # ADK dev server with built-in UI
 ```
 
-### Inference (Jev `/v1/systemone` wire protocol)
+Or run the automated demo script against live RHOAI endpoints:
+
+```bash
+scripts/agent-demo.sh         # 3 FSI scenarios with pass/fail
+```
+
+---
+
+## Demo Scenarios
+
+### Scenario 1: EU PII (GDPR)
+German customer record (name, DOB, account number) → Laya classifies as **PII** → policy requires EU residency → routed to `eu_processor` (Frankfurt, GDPR controls).
+
+### Scenario 2: US Financial (CCPA)
+US bank wire transfer → Laya classifies as **financial** → policy requires US residency → routed to `us_processor` (Iowa, CCPA compliance).
+
+### Scenario 3: Cross-Border Conflict
+EU health record with *all* jurisdictions excluded → policy correctly **rejects** the request — no compliant processor available, escalates to human review.
+
+---
+
+## API Reference
+
+### Laya — `/v1/systemone` (Jev wire protocol)
 
 ```bash
 curl -sk -X POST \
   https://$(oc get route laya-api-gpu -n laya-demo -o jsonpath='{.spec.host}')/v1/systemone \
   -H 'Content-Type: application/json' \
   -d '{
-    "state": "The customer wants to transfer $50,000 overseas immediately",
+    "state": "Customer Hans Mueller, Berlin. DOB: 1985-03-15. Account DE89370400440532013000.",
     "questions": {
-      "risk": {
+      "data_type": {
         "type": "choice",
-        "instructions": "What is the compliance risk level?",
+        "instructions": "What type of sensitive data is present?",
         "criteria": {
-          "high_risk": {},
-          "medium_risk": {},
-          "low_risk": {}
+          "PII": {"description": "Personal identifiable information"},
+          "financial": {"description": "Financial records or transactions"},
+          "public": {"description": "Non-sensitive public data"}
         }
       }
     }
   }'
 ```
 
-### Example response
-
+Response:
 ```json
 {
   "model": "laya-rl-agent",
   "answers": {
-    "risk": {
-      "type": "choice",
-      "choice": "high_risk",
-      "probabilities": { "high_risk": 0.87, "medium_risk": 0.09, "low_risk": 0.04 },
-      "confidence": 0.82,
-      "answer_confidence": 0.87
+    "data_type": {
+      "choice": "PII",
+      "probabilities": {"PII": 0.73, "financial": 0.15, "public": 0.12},
+      "confidence": 0.58,
+      "answer_confidence": 0.73
     }
   },
-  "usage": { "input_tokens": 42, "output_tokens": 0 },
-  "routing": { "model": "english", "reason": "English Latin text" }
+  "usage": {"input_tokens": 48, "output_tokens": 0}
 }
 ```
+
+### Agent — `/chat/completions` (OpenAI-compatible)
+
+```bash
+curl -sk -X POST \
+  https://$(oc get route cbdr-agent -n laya-demo -o jsonpath='{.spec.host}')/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "cross-border-data-router",
+    "stream": false,
+    "messages": [{"role": "user", "content": "Route EU PII from Germany, required residency EU, exclude US and CN"}]
+  }'
+```
+
+Supports `"stream": true` for Server-Sent Events (used by the playground UI).
 
 ---
 
@@ -160,10 +249,10 @@ curl -sk -X POST \
 
 | Metric | CPU | GPU (A10G) |
 |---|---|---|
-| In-cluster latency | ~145 ms | ~28 ms |
-| External (via Route) | ~284 ms | ~173 ms |
-| Memory usage | ~4 Gi | ~4 Gi |
-| Checkpoints loaded | english, multilingual | english, multilingual |
+| Laya classification | ~145 ms | ~28 ms |
+| Laya via Route (edge TLS) | ~284 ms | ~173 ms |
+| Full agent pipeline (Laya + Qwen + policy) | — | ~5-8 s |
+| Memory (Laya) | ~4 Gi | ~4 Gi |
 
 ---
 
@@ -172,28 +261,53 @@ curl -sk -X POST \
 ```
 manifests/
   00-namespace.yaml              Namespace with RHOAI dashboard labels
-  01-pvcs.yaml                   PersistentVolumeClaims for model cache
+  01-pvcs.yaml                   PVCs for HuggingFace model cache
   02-build.yaml                  BuildConfigs + ImageStream (CPU & CUDA)
-  03-serving-runtimes.yaml       3 custom ServingRuntimes
+  03-serving-runtimes.yaml       3 custom ServingRuntimes (CPU, GPU, Playground)
   04-inference-services.yaml     3 KServe InferenceServices
   05-routes.yaml                 External Routes with edge TLS
+  06-agent.yaml                  Agent Deployment + Service + Route
+
+agent/
+  main.py                        FastAPI entrypoint (OpenAI-compatible API + Playground UI)
+  Dockerfile                     UBI9 container image (uv + uvicorn)
+  app/
+    agent.py                     ADK root agent (orchestrator)
+    model.py                     Shared LLM config (rh-maas-litellm → Qwen)
+    prompt.py                    System 1+2 orchestrator prompt
+    tools/
+      laya_tool.py               classify_with_laya — calls Laya GPU
+      routing_tool.py            evaluate_and_route — calls policy engine
+    policy/
+      engine.py                  3-stage routing policy engine
+      cards.py                   A2A AgentCard registry (OpenEAGO metadata)
+      models.py                  Data models for routing requests/decisions
+    sub_agents/                  EU, UK, US regional processor agents
+  playground/
+    templates/index.html         Chat UI (streaming, tool-call visualization)
+  tests/                         Unit + integration tests
+  .env.example                   Endpoint configuration template
+
 scripts/
-  verify.sh                     12-point end-to-end verification
-  demo.sh                       Interactive FSI scenario demo
-Dockerfile.demo                  Multi-stage container image
+  verify.sh                      12-point infrastructure verification
+  demo.sh                        Interactive Laya FSI demo (5 scenarios)
+  agent-demo.sh                  Agent + Laya + Qwen integration demo (3 scenarios)
 ```
 
 ---
 
-## Demo Scenarios (FSI)
+## RHOAI Features Demonstrated
 
-Run `scripts/demo.sh` to walk through five financial-services scenarios:
-
-1. **Trade Routing** — dark pool vs. exchange vs. hold (97% confidence)
-2. **Compliance Triage** — insider trading detection (95% confidence)
-3. **Jailbreak Detection** — prompt injection guardrails
-4. **Multilingual** — French compliance routing via the `multilingual` checkpoint
-5. **CPU vs GPU** — side-by-side latency comparison
+| Feature | How It's Used |
+|---|---|
+| **KServe InferenceService** | Managed model serving with health probes, scaling, lifecycle |
+| **Custom ServingRuntime** | Laya packaged as a reusable RHOAI runtime template |
+| **RawDeployment mode** | Lightweight KServe — no Knative/Istio required |
+| **LLMInferenceService** | Qwen 2.5 Coder 7B served by vLLM via MaaS gateway |
+| **MaaS Gateway** | Unified API gateway for LLM endpoints |
+| **RHOAI Dashboard** | All resources labeled `opendatahub.io/dashboard: "true"` |
+| **GPU scheduling** | `nodeSelector` + tolerations for NVIDIA A10G nodes |
+| **OpenShift BuildConfig** | Binary Docker builds for all container images |
 
 ---
 
@@ -207,11 +321,15 @@ oc delete project laya-demo
 
 ## Related
 
-- [Laya](https://github.com/convaiinnovations/laya) — the decision engine
-- [Jev](https://jev.ai) — the wire protocol Laya speaks
-- [RHOAI 3.5 docs: Custom ServingRuntimes](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/configuring_your_model-serving_platform/configuring_model_servers)
-- [RHOAI 3.5 docs: Deploying models](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/deploying_models/deploying_models)
+- [Laya](https://github.com/convaiinnovations/laya) — on-device decision engine
+- [Jev](https://jev.ai) — wire protocol Laya speaks
+- [rh-maas-litellm](https://github.com/rrbanda/rh-maas-litellm) — ADK LiteLlm adapter for Red Hat MaaS
+- [Google ADK](https://adk.dev/) — Agent Development Kit 2.0
+- [A2A Protocol](https://google.github.io/A2A/) — Agent-to-Agent communication
+- [OpenEAGO](https://openeago.finos.org/) — geographic/compliance metadata for A2A
+- [Agentic Starter Kits](https://github.com/red-hat-data-services/agentic-starter-kits) — Red Hat ADK deployment templates
+- [RHOAI docs: Custom ServingRuntimes](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/configuring_your_model-serving_platform/configuring_model_servers)
 
 ## License
 
-Demo manifests: Apache-2.0. Laya itself is licensed under its own terms — see the [Laya repository](https://github.com/convaiinnovations/laya).
+Demo manifests and agent code: Apache-2.0. Laya itself is licensed under its own terms — see the [Laya repository](https://github.com/convaiinnovations/laya).

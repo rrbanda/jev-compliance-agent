@@ -2,3 +2,14 @@
 *.swp
 *.swo
 *~
+
+# Environment files (may contain endpoint URLs or API keys)
+.env
+agent/.env
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
