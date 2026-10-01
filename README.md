@@ -46,26 +46,131 @@ The chat UI shows every step: Laya classification (blue tool call), policy engin
 
 ## How It Works
 
+### Agent Pipeline
+
+```mermaid
+flowchart TD
+    User["👤 User Request\n'Route this German PII record under GDPR'"]
+    
+    subgraph ADK["Google ADK 2.0 Agent (Qwen 2.5 Coder 7B on RHOAI)"]
+        direction TB
+        Orchestrator["Orchestrator LLM\nReasoning + Tool Calling"]
+        
+        subgraph S1["Step 1 — System 1 Classification ⚡ ~28ms"]
+            LayaTool["classify_with_laya(text)"]
+            LayaGPU["Laya GPU InferenceService\n(KServe on RHOAI)"]
+            LayaResult["{ classification: PII,\n  confidence: 0.73,\n  has_pii: true }"]
+        end
+        
+        subgraph S2["Step 2 — Policy Engine ⚡ <1ms"]
+            RouteTool["evaluate_and_route(PII, EU, ...)"]
+            subgraph Filters["3-Stage Filter"]
+                F1["Residency Filter\nEU/EEA covers required EU? ✓"]
+                F2["Jurisdiction Exclusion\nUS, CN on exclude list? ✗ us_processor"]
+                F3["Scoring\neu_processor=1.0 (preferred)"]
+            end
+            RouteResult["{ decision: approved,\n  agent: eu_processor,\n  jurisdiction: EU }"]
+        end
+        
+        subgraph S3["Step 3 — Delegate to Regional Processor"]
+            EU["eu_processor\nGDPR · EU-WEST"]
+            UK["uk_processor\nUK-GDPR · UK-LONDON"]
+            US["us_processor\nCCPA · US-IOWA"]
+        end
+    end
+    
+    Result["✅ Processed in EU-WEST\nunder GDPR controls"]
+
+    User --> Orchestrator
+    Orchestrator --> LayaTool
+    LayaTool --> LayaGPU
+    LayaGPU --> LayaResult
+    LayaResult --> Orchestrator
+    Orchestrator --> RouteTool
+    RouteTool --> F1 --> F2 --> F3
+    F3 --> RouteResult
+    RouteResult --> Orchestrator
+    Orchestrator --> EU
+    EU --> Result
+
+    style S1 fill:#e8f0fe,stroke:#4285f4
+    style S2 fill:#e6f4ea,stroke:#34a853
+    style S3 fill:#fef7e0,stroke:#f9ab00
 ```
-  User: "Route this German PII record under GDPR"
-    │
-    ▼
-┌── ADK Agent (Qwen 2.5 on RHOAI) ────────────────────────┐
-│                                                           │
-│  Step 1: classify_with_laya(text)          ⚡ ~28ms       │
-│          → Laya GPU: "PII, 73% confidence"               │
-│                                                           │
-│  Step 2: evaluate_and_route(...)           ⚡ <1ms        │
-│          → Policy engine filters:                        │
-│            ✓ eu_processor — residency EU/EEA covers EU   │
-│            ✓ uk_processor — residency UK/EU covers EU    │
-│            ✗ us_processor — residency US, no EU coverage │
-│          → Scores: eu_processor=1.0 (preferred)          │
-│                                                           │
-│  Step 3: Delegate to eu_processor                        │
-│          → "Processed in EU-WEST under GDPR controls"    │
-└───────────────────────────────────────────────────────────┘
+
+### Laya DecisionModel — How System 1 Actually Works
+
+Laya is not a generic classifier — it's a [Jev](https://jev.ai)-style **decision model** with a purpose-built architecture trained via reinforcement learning.
+
+```mermaid
+flowchart TD
+    subgraph Input["Input Sequence (Jev Wire Format)"]
+        direction LR
+        CLS["[CLS]"]
+        Type["&lt;type&gt;\nchoice"]
+        Inst["instructions:\n'What type of\nsensitive data?'"]
+        SEP1["[SEP]"]
+        M0["[MASK]"]
+        O0["PII"]
+        M1["[MASK]"]
+        O1["financial"]
+        M2["[MASK]"]
+        O2["public"]
+        SEP2["[SEP]"]
+        State["Customer Hans Mueller,\nBerlin. DOB: 1985-03-15.\nAccount DE8937..."]
+        SEP3["[SEP]"]
+    end
+
+    subgraph Encoder["Bidirectional Transformer Encoder (ModernBERT-large, 421M params)"]
+        ENC["Full bidirectional attention over entire sequence\n→ hidden states h[B, L, 1024]"]
+    end
+    
+    TypeEmb["+ type_emb(choice)\nEmbedding(3, d) — tells head\nwhether this is choice / score / noul"]
+    
+    subgraph Head["Decision Head (2-layer TransformerEncoder, trained params)"]
+        TF["2-layer TransformerEncoder\nwith dynamic multi-head attention"]
+    end
+    
+    subgraph Gather["Gather Hidden States at [MASK] Positions"]
+        G0["h[MASK₀] → PII"]
+        G1["h[MASK₁] → financial"]
+        G2["h[MASK₂] → public"]
+    end
+    
+    subgraph Scorer["Scorer: LayerNorm → Linear → GELU → Linear → squeeze"]
+        Logits["logits: [2.1, 0.8, -0.3]"]
+        Softmax["softmax + temperature calibration"]
+        Probs["probabilities:\nPII: 0.73, financial: 0.15, public: 0.12"]
+    end
+    
+    subgraph ActHead["Act Head: Should the model act on this answer?"]
+        Features["[CLS]_pooled ∥ top1 ∥ margin ∥ entropy ∥ k"]
+        ActMLP["Linear(d+4, 256) → GELU → Linear(256, n_act)"]
+        ActProb["act_probability: 0.97\n(high confidence → act on answer)"]
+    end
+
+    Input --> Encoder
+    Encoder --> TypeEmb --> Head
+    Head --> Gather
+    Gather --> Scorer
+    Scorer --> Logits --> Softmax --> Probs
+    Encoder --> ActHead
+    Gather --> Features --> ActMLP --> ActProb
+
+    style Input fill:#f5f5f5,stroke:#999
+    style Encoder fill:#e8f0fe,stroke:#4285f4
+    style Head fill:#d4e4fc,stroke:#4285f4
+    style Scorer fill:#e6f4ea,stroke:#34a853
+    style ActHead fill:#fef7e0,stroke:#f9ab00
 ```
+
+**Key architectural choices:**
+
+- **[MASK]-marker probing (Jev protocol)** — Each option gets a `[MASK]` token. The encoder sees the question, all options, and the full state text simultaneously in a single bidirectional pass. Hidden states at `[MASK]` positions are gathered and scored — the options compete against each other.
+- **Variable options at inference time** — Unlike a fixed-class classifier, the number of options is set per request. You can ask 2 options or 20 — the architecture handles both.
+- **RL training with strictly proper scoring rules** — Trained with a reward combining log score + spherical score + ranked probability score (for ordinal questions). This incentivizes *calibrated* probability distributions — the model is penalized for over-confidence, not just wrong answers.
+- **Act head for abstention** — A separate MLP head decides whether the model should act on its answer, based on the [CLS] pooled representation + decision statistics (top-1 probability, margin, entropy). This enables confidence-gated workflows.
+- **Temperature-calibrated outputs** — Per-question-type temperatures are fitted post-training so that reported confidence scores are actually calibrated (of answers returned at confidence 0.7, about 70% are correct).
 
 ### Three-stage policy engine
 
