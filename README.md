@@ -1,15 +1,29 @@
 # Laya + Agentic AI on Red Hat OpenShift AI
 
-A production-ready demo of **System 1 + System 2 AI** for regulated cross-border data routing — entirely on [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) (RHOAI). No external API calls leave the cluster.
+## The Problem
 
-| Layer | Component | Role | Latency |
+Financial institutions operating across borders face a constant tension: **every piece of customer data must be classified and routed to the right jurisdiction before it can be processed** — and getting it wrong means regulatory fines (GDPR: up to 4% of global revenue, CCPA: $7,500 per violation).
+
+Today this is typically handled by:
+- **Manual review** — slow, expensive, doesn't scale
+- **Rule-based systems** — brittle, can't handle unstructured text
+- **LLMs** — can reason about regulations, but hallucinate classifications, take seconds per request, and often require sending data to external APIs (a compliance violation in itself)
+
+None of these work well alone. What's needed is a system that is **fast** (classify data in milliseconds, not seconds), **reliable** (auditable confidence scores, not hallucinated labels), **smart** (reason about complex multi-jurisdiction rules), and **sovereign** (nothing leaves your infrastructure).
+
+## The Solution
+
+This demo combines two AI systems — each doing what it's best at — into a single agentic pipeline, running entirely on [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) (RHOAI). No external API calls leave the cluster.
+
+| Layer | Component | What it does | Latency |
 |---|---|---|---|
-| **System 1** | [Laya](https://github.com/convaiinnovations/laya) (421M params, GPU) | Fast neural data classifier | ~28 ms |
-| **System 2** | Qwen 2.5 Coder 7B (vLLM) | Reasoning, tool-calling, orchestration | ~2-5 s |
-| **Policy** | Python rule engine | Hard compliance filters (residency, jurisdiction) | <1 ms |
-| **Agent** | [Google ADK 2.0](https://adk.dev/) | Orchestrates the pipeline end-to-end | — |
+| **System 1** — Fast Classifier | [Laya](https://github.com/convaiinnovations/laya) (421M params, GPU) | Classifies data as PII / financial / health / public with calibrated confidence scores | ~28 ms |
+| **System 2** — Reasoning LLM | Qwen 2.5 Coder 7B (vLLM) | Extracts context, infers regulatory requirements, orchestrates multi-step routing | ~2-5 s |
+| **Policy Engine** | Python rule engine | Enforces hard compliance filters — residency, jurisdiction exclusions | <1 ms |
+| **Orchestrator** | [Google ADK 2.0](https://adk.dev/) | Wires it all together as an agentic tool-calling pipeline | — |
+| **Observability** | [MLflow](https://mlflow.org/) tracing | Logs every LLM call and tool invocation for audit and debugging | — |
 
-> **Why both?** An LLM alone takes seconds and can hallucinate classifications. Laya gives a reliable, auditable classification in 28ms — the LLM then reasons about *what to do* with that classification. Fast where it matters, smart where it counts.
+> **Why two models?** An LLM alone takes seconds and can hallucinate a "PII" classification that's actually financial data — a routing mistake with regulatory consequences. Laya gives a reliable, auditable classification in 28ms with calibrated probabilities. The LLM then reasons about *what to do* with that classification: which regulations apply, which jurisdictions are allowed, and which processor should handle the data. **Fast where it matters, smart where it counts.**
 
 ---
 
@@ -86,6 +100,10 @@ Served by vLLM via RHOAI's MaaS gateway (`LLMInferenceService`). The agent conne
 ### ADK Agent
 
 A standard OpenShift `Deployment` with an OpenAI-compatible `/chat/completions` endpoint and the playground chat UI at `/`. Built as a container image via OpenShift `BuildConfig`.
+
+### MLflow Tracing (optional)
+
+When `MLFLOW_TRACKING_URI` is set, the agent automatically logs every LLM call (via LiteLLM autolog) and can trace tool invocations to an MLflow server on the cluster. If the MLflow server is unreachable or the env var is unset, the agent continues without tracing — no crash, no degradation.
 
 ---
 
@@ -278,6 +296,8 @@ agent/
     tools/
       laya_tool.py               classify_with_laya — calls Laya GPU
       routing_tool.py            evaluate_and_route — calls policy engine
+    app_utils/
+      telemetry.py               MLflow tracing (graceful degradation if unavailable)
     policy/
       engine.py                  3-stage routing policy engine
       cards.py                   A2A AgentCard registry (OpenEAGO metadata)
@@ -308,6 +328,7 @@ scripts/
 | **RHOAI Dashboard** | All resources labeled `opendatahub.io/dashboard: "true"` |
 | **GPU scheduling** | `nodeSelector` + tolerations for NVIDIA A10G nodes |
 | **OpenShift BuildConfig** | Binary Docker builds for all container images |
+| **MLflow Tracing** | Optional LLM call logging and tool-invocation tracing for audit |
 
 ---
 
