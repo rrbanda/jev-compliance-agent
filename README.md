@@ -194,6 +194,47 @@ source .venv/bin/activate
 uv run adk web .   # Opens ADK playground at http://localhost:8000
 ```
 
+### Testing from the UI
+
+There are two ways to interact with the agent through a browser:
+
+**Option 1: ADK Playground** (recommended for development)
+
+```bash
+cd agent
+uv run adk web .
+```
+
+Opens the Google ADK built-in playground at `http://localhost:8000`.  Shows the
+full agent conversation with tool calls expanded — you can see each of the
+four pipeline steps: `classify_with_laya` → `apply_compliance_policy` →
+`evaluate_and_route` → sub-agent.
+
+**Option 2: Custom Playground** (deployed endpoint)
+
+```bash
+cd agent
+uv run uvicorn main:app --host 0.0.0.0 --port 8080
+```
+
+Opens the custom chat UI at `http://localhost:8080`.  This is the same UI
+served when the agent is deployed to OpenShift.  It shows tool calls and
+tool responses as styled cards alongside the agent's final answer.
+
+**Try these example prompts** (click the buttons in the UI or paste):
+
+1. **EU PII** → GDPR routing:
+   > Classify and route: Customer Maria Schmidt, born 15 March 1988, Friedrichstrasse 42, 10117 Berlin, Germany. Tax ID: 12/345/67890. Requesting refund for duplicate charge on invoice #DE-2026-4411.
+
+2. **US Health** → HIPAA + PII override:
+   > Classify and route: Patient John Doe, SSN 123-45-6789, DOB 07/22/1975. Blue Cross Blue Shield policy #BCBS-2026-99887. Diagnosis: Type 2 diabetes mellitus. Cleveland Clinic, Ohio.
+
+3. **UK PII** → human review triggered:
+   > Classify and route: Account holder James Wilson, 42 Baker Street, London NW1 6XE. National Insurance Number: QQ 12 34 56 C. HSBC account ending 7891. Disputed direct debit of GBP 450.
+
+4. **Public data** → no restrictions:
+   > Classify and route: Q3 2026 Earnings Report for Acme Corp (NYSE: ACME). Revenue grew 12% YoY to $4.2B. Operating margin expanded to 18.5%.
+
 ### OpenShift Deployment
 
 ```bash

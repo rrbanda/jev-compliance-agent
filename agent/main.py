@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="Cross-Border Data Router",
     description=(
-        "ADK agent powered by Laya (System 1) and Qwen (System 2) on RHOAI. "
+        "ADK agent powered by Laya (System 1) and Gemini (System 2). "
         "OpenAI-compatible /chat/completions endpoint."
     ),
     lifespan=lifespan,

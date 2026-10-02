@@ -233,19 +233,20 @@
   <div class="header">
     <span id="statusDot" class="status-dot"></span>
     Cross-Border Data Router — Playground
-    <span class="subtitle">Laya (System 1) + Qwen (System 2) on RHOAI</span>
+    <span class="subtitle">Laya (System 1) + Gemini (System 2)</span>
   </div>
 
   <div class="chat-container" id="chat"></div>
 
   <div class="examples">
-    <button onclick="useExample(this)">Route EU PII from Frankfurt, required residency EU, exclude US and CN</button>
-    <button onclick="useExample(this)">Route US financial transaction from New York, required residency US, preferred US and CA</button>
-    <button onclick="useExample(this)">Route UK health record from London, required residency UK, exclude CN and RU</button>
+    <button onclick="useExample(this)">Classify and route: Customer Maria Schmidt, born 15 March 1988, Friedrichstrasse 42, 10117 Berlin, Germany. Tax ID: 12/345/67890. Requesting refund for duplicate charge on invoice #DE-2026-4411.</button>
+    <button onclick="useExample(this)">Classify and route: Patient John Doe, SSN 123-45-6789, DOB 07/22/1975. Blue Cross Blue Shield policy #BCBS-2026-99887. Diagnosis: Type 2 diabetes mellitus. Cleveland Clinic, Ohio.</button>
+    <button onclick="useExample(this)">Classify and route: Account holder James Wilson, 42 Baker Street, London NW1 6XE. National Insurance Number: QQ 12 34 56 C. HSBC account ending 7891. Disputed direct debit of GBP 450.</button>
+    <button onclick="useExample(this)">Classify and route: Q3 2026 Earnings Report for Acme Corp (NYSE: ACME). Revenue grew 12% YoY to $4.2B. Operating margin expanded to 18.5%.</button>
   </div>
 
   <div class="input-area">
-    <textarea id="input" placeholder="Describe data to route (e.g. 'Route this PII record from Germany under GDPR…')" rows="1"
+    <textarea id="input" placeholder="Paste a data record to classify and route (e.g. customer details, health records, financial data…)" rows="1"
               onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"></textarea>
     <button id="sendBtn" onclick="sendMessage()">Send</button>
   </div>
