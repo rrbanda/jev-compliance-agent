@@ -27,9 +27,9 @@ flowchart TD
 
     subgraph SYS1 [" 🧠 System 1 · Jev-compatible Decision Models "]
         direction TB
-        LAYA["🟢 Laya 421M\n~150ms · 0 output tokens\n─────────────────────\ndata_type → financial 0.70\npii_detected → 0.33\nlocation → EU 0.51 ⚠️\nsensitivity → 1.72\nneeds_review → 0.17"]
-        GATE{{"🚦 Confidence Gate\nanswer_confidence < 0.55 ?"}}
-        DGEMMA["🟣 DiffusionGemma 26B\n~1s · same 5 questions\nsame /v1/systemone protocol\n─────────────────────\nlocation → EU 0.9999 ✅\ndata_type → health 0.99 ✅"]
+        LAYA["🟢 Laya 421M<br/>~150ms · 0 output tokens<br/>─────────────────────<br/>data_type → financial 0.70<br/>pii_detected → 0.33<br/>location → EU 0.51 ⚠️<br/>sensitivity → 1.72<br/>needs_review → 0.17"]
+        GATE{{"🚦 Confidence Gate<br/>answer_confidence < 0.55 ?"}}
+        DGEMMA["🟣 DiffusionGemma 26B<br/>~1s · same 5 questions<br/>same /v1/systemone protocol<br/>─────────────────────<br/>location → EU 0.9999 ✅<br/>data_type → health 0.99 ✅"]
         SKIP(["✅ Use Laya answers"])
 
         LAYA --> GATE
@@ -41,9 +41,9 @@ flowchart TD
     DGEMMA --> POLICY
     SKIP --> POLICY
 
-    POLICY["⚖️ Application Policy\n─────────────────────\nPII override: pii ≥ 0.70 ?\nRegime table: location × type → law\nEU + financial → GDPR\nResidency: EU/EEA required\nExcluded: CHINA, RUSSIA"]
-    ROUTING["🗺️ Routing Engine\n─────────────────────\nA2A Agent Cards + OpenEAGO\nResidency → Exclusion → Score"]
-    GEMINI["💬 Gemini 2.5 Flash · System 2\n─────────────────────\nExplains the decision\nRoutes to regional sub-agent"]
+    POLICY["⚖️ Application Policy<br/>─────────────────────<br/>PII override: pii ≥ 0.70 ?<br/>Regime table: location × type → law<br/>EU + financial → GDPR<br/>Residency: EU/EEA required<br/>Excluded: CHINA, RUSSIA"]
+    ROUTING["🗺️ Routing Engine<br/>─────────────────────<br/>A2A Agent Cards + OpenEAGO<br/>Residency → Exclusion → Score"]
+    GEMINI["💬 Gemini 2.5 Flash · System 2<br/>─────────────────────<br/>Explains the decision<br/>Routes to regional sub-agent"]
 
     POLICY --> ROUTING --> GEMINI
 
