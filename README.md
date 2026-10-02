@@ -1,8 +1,8 @@
 # Cross-Border Data Router
 
-A compliance-aware data routing agent that combines **calibrated neural classification** (Laya) with **LLM reasoning** (Gemini) and a **deterministic policy engine**.
+A compliance-aware data routing agent that combines **two Jev-compatible decision models** — Laya (fast) and DiffusionGemma (deep) — with **LLM reasoning** (Gemini) and a **deterministic policy engine**.
 
-The key idea: Laya answers five typed questions in one forward pass (~145ms, zero generated tokens).  An application policy maps those calibrated probabilities to routing decisions.  Gemini explains the result.  The model provides the signal; the policy provides the decision.
+The key idea: Laya answers five typed questions in one forward pass (~150ms, zero generated tokens).  If its confidence is low, DiffusionGemma 26B is called automatically with the **same five questions** for a deeper read (~1s).  Both speak the Jev `/v1/systemone` protocol.  An application policy maps those calibrated probabilities to routing decisions.  Gemini explains the result.  The models provide the signal; the policy provides the decision.
 
 ## The Problem
 
@@ -27,17 +27,36 @@ Neither provides **auditable probability distributions** that compliance teams n
 │  "Route this: Maria Schmidt, Berlin, Tax ID 12/345/67890"   │
 └─────────────┬───────────────────────────────────────────────┘
               │
-     Step 1   ▼   ONE Jev call, FIVE typed questions, ONE forward pass
+  Step 1a     ▼   ONE Jev-compatible call, FIVE typed questions
 ┌─────────────────────────────────────────────────────────────┐
-│                    Laya (System 1)                            │
-│  421M encoder · ~145ms · 0 output tokens · non-autoregressive│
+│              Laya (System 1 — fast)                           │
+│  421M encoder · ~150ms · 0 output tokens · non-autoregressive│
 │                                                              │
 │  data_type           choice → financial (0.70)               │
 │  pii_detected        noul   → 0.33                           │
-│  data_subject_location choice → EU (0.57)                    │
+│  data_subject_location choice → EU (0.51)                    │
 │  sensitivity         score  → 1.72 / 3                       │
 │  needs_human_review  noul   → 0.17                           │
 └─────────────┬───────────────────────────────────────────────┘
+              │
+  Step 1b     ▼   Confidence gate (Example 18 pattern)
+              │   data_type_conf < 0.55 OR location_conf < 0.55?
+              │
+        ┌─────┴─────┐
+    YES │           │ NO → skip to Step 2
+        ▼           │
+┌───────────────┐   │
+│ DiffusionGemma│   │
+│ (System 1 —   │   │
+│  deep)        │   │
+│ 26B · ~1s     │   │
+│ same 5 Qs     │   │
+│ same protocol │   │
+│               │   │
+│ EU → 0.9999   │   │
+│ health → 0.99 │   │
+└───────┬───────┘   │
+        └─────┬─────┘
               │
      Step 2   ▼   Deterministic rules, tuneable thresholds
 ┌─────────────────────────────────────────────────────────────┐
@@ -65,9 +84,22 @@ Neither provides **auditable probability distributions** that compliance teams n
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## The Jev Question Schema
+## Two Jev-compatible Models, One Protocol
 
-The five questions are answered **simultaneously** in one forward pass.  Each uses the right question type for its answer shape:
+Laya and DiffusionGemma are **not** Jev — they are separate open-source / research models that speak the same `POST /v1/systemone` wire protocol as TypeSafe's hosted Jev API.  Both return the same answer shapes (`choice`, `score`, `noul`) with calibrated probability distributions.  An existing Jev client just needs its `baseUrl` repointed.
+
+| | Laya | DiffusionGemma |
+|---|---|---|
+| Parameters | 421M encoder | 26B (A4B active) |
+| Architecture | Non-autoregressive | Diffusion transformer |
+| Latency | ~150ms | ~1s |
+| Output tokens | 0 | 10 |
+| GPU | A10G | H200 MIG 3g.71gb |
+| When called | Every request | Only when Laya's confidence < 0.55 |
+
+## The Question Schema
+
+The five questions are answered **simultaneously** in one forward pass by whichever model handles the request.  Each uses the right question type for its answer shape:
 
 ```python
 COMPLIANCE_QUESTIONS = {
@@ -97,7 +129,7 @@ COMPLIANCE_QUESTIONS = {
 }
 ```
 
-The probabilities are **calibrated** — when Laya says 0.94, the true positive rate is approximately 94%.  This is what compliance requires: not "the AI said PII", but "94% probability of PII exceeding our 70% threshold".
+The probabilities are **calibrated** — when the model says 0.94, the true positive rate is approximately 94%.  This is what compliance requires: not "the AI said PII", but "94% probability of PII exceeding our 70% threshold".
 
 ## The Application Policy
 
@@ -125,61 +157,69 @@ When a regulation changes, update the table — no model retraining, no redeploy
 
 ## Demo Scenarios
 
-### 1. EU Financial — Clean Routing
+### 1. EU Health — DiffusionGemma Confirms
 
-> "Route: Maria Schmidt, Berlin, Germany. Tax ID 12/345/67890. Invoice refund."
+> "Route: Patient Maria Schmidt, Berlin. Diagnosis: Type 2 Diabetes. Prescription: Metformin 500mg."
 
-| Question | Answer | Probability |
+| Question | Laya (150ms) | DiffusionGemma (1s) |
 |---|---|---|
-| data_type | financial | 0.70 |
-| pii_detected | — | 0.33 |
-| location | EU | 0.57 |
-| sensitivity | — | 1.72 |
-| needs_review | — | 0.17 |
+| data_type | health (0.93) | health (0.99) |
+| pii_detected | 0.94 | 1.00 |
+| location | EU (0.51) ⚠️ | EU (0.9999) ✓ |
+| sensitivity | 2.49 | 2.49 |
+| needs_review | 0.01 | 0.01 |
 
-**Policy**: EU + financial → GDPR → route to EU Agent.  165ms.
+**Confidence gate triggered**: Laya's location confidence (0.51) was below the 0.55 gate, so DiffusionGemma was called with the same questions.  DiffusionGemma confirmed EU at 0.9999.  Total: ~800ms.
 
-### 2. US Health + PII Override
+**Policy**: EU + health → GDPR → route to EU Agent.
 
-> "Route: Patient John Doe, SSN 123-45-6789. Diagnosis: Type 2 diabetes. Cleveland Clinic, Ohio."
+### 2. US Health + PII Override — Laya Handles Alone
 
-| Question | Answer | Probability |
+> "Route: Patient John Smith, SSN 123-45-6789. Medicare ID: 1EG4-TE5-MK72. Diagnosis: Hypertension. Dr. Williams, Mayo Clinic, Rochester MN."
+
+| Question | Laya (158ms) |
+|---|---|
+| data_type | health (0.76) |
+| pii_detected | 0.84 |
+| location | US (0.57) ✓ |
+| sensitivity | 1.57 |
+| needs_review | 0.18 |
+
+**No escalation**: Both data_type confidence (0.76) and location confidence (0.57) were above the 0.55 gate.  158ms.
+
+**Policy**: pii_detected (0.84) ≥ 0.70 → PII override.  But original data_type was health → HIPAA still applies (not CCPA).  Route to US Agent.
+
+### 3. UK Financial — DiffusionGemma Confirms Location
+
+> "Route: Account holder James Wilson, London. Barclays sort code 20-71-04, account 41298756. GBP 15,340.00 pension transfer."
+
+| Question | Laya (150ms) | DiffusionGemma (1s) |
 |---|---|---|
-| data_type | health | 0.84 |
-| pii_detected | — | **0.78** |
-| location | US | 0.62 |
-| sensitivity | — | 1.57 |
-| needs_review | — | 0.18 |
+| data_type | financial (0.93) | financial (0.9992) |
+| pii_detected | 0.57 | 0.87 |
+| location | other (0.46) ⚠️ | UK (0.9998) ✓ |
+| sensitivity | 1.57 | 1.50 |
+| needs_review | 0.21 | 0.01 |
 
-**Policy**: pii_detected (0.78) ≥ 0.70 → PII override.  But original data_type was health → HIPAA still applies (not CCPA).  Route to US Agent.  140ms.
+**Confidence gate triggered**: Laya's location confidence (0.46) was below the 0.55 gate — it actually picked "other" instead of UK.  DiffusionGemma corrected to UK at 0.9998.  Total: ~800ms.
 
-### 3. UK PII — Human Review Triggered
-
-> "Route: James Wilson, 42 Baker Street, London NW1 6XE. NI Number: QQ 12 34 56 C. HSBC account. GBP 450 disputed."
-
-| Question | Answer | Probability |
-|---|---|---|
-| data_type | financial | 0.94 |
-| pii_detected | — | **0.57** |
-| location | UK | **0.48** (other: 0.33) |
-| sensitivity | — | 1.57 |
-| needs_review | — | 0.21 |
-
-**Policy**: Location confidence (0.48) is borderline.  pii_detected (0.57) conflicts with data_type=financial.  → **Human review required**.  Route to UK Agent but flag for compliance officer review.  145ms.
+**Policy**: UK + financial → UK_GDPR.  pii_detected (0.87) ≥ 0.70 → PII override.  Route to UK Agent.
 
 ### 4. Public Data — No Restrictions
 
-> "Route: Q3 2026 Earnings Report, Acme Corp (NYSE: ACME). Revenue $4.2B."
+> "Route: Open-source project README: 'This library is MIT-licensed. Install with pip install example-lib.'"
 
-| Question | Answer | Probability |
-|---|---|---|
-| data_type | financial | **0.94** |
-| pii_detected | — | 0.05 |
-| location | other | **0.79** |
-| sensitivity | — | 1.80 |
-| needs_review | — | 0.16 |
+| Question | Laya (143ms) |
+|---|---|
+| data_type | public (0.79) |
+| pii_detected | 0.05 |
+| location | other (0.79) |
+| sensitivity | 0.80 |
+| needs_review | 0.16 |
 
-**Policy**: No specific location + no PII → no regime → route anywhere.  143ms.
+**No escalation**: Both confidences above 0.55 gate.  143ms.
+
+**Policy**: No specific location + no PII → no regime → route anywhere.
 
 ## Setup
 
@@ -188,7 +228,11 @@ When a regulation changes, update the table — no model retraining, no redeploy
 ```bash
 cd agent
 cp .env.example .env
-# Edit .env — set GOOGLE_API_KEY to your Gemini key
+# Edit .env:
+#   GOOGLE_API_KEY      — your Gemini key (https://aistudio.google.com/apikey)
+#   LAYA_API_URL        — Laya endpoint (default provided)
+#   DIFFUSIONGEMMA_API_URL — DiffusionGemma endpoint (default provided)
+#   CONFIDENCE_GATE     — gate threshold (default 0.55)
 uv sync
 source .venv/bin/activate
 uv run adk web .   # Opens ADK playground at http://localhost:8000
@@ -207,8 +251,8 @@ uv run adk web .
 
 Opens the Google ADK built-in playground at `http://localhost:8000`.  Shows the
 full agent conversation with tool calls expanded — you can see each of the
-four pipeline steps: `classify_with_laya` → `apply_compliance_policy` →
-`evaluate_and_route` → sub-agent.
+pipeline steps: `classify_with_laya` (which may escalate to DiffusionGemma) →
+`apply_compliance_policy` → `evaluate_and_route` → sub-agent.
 
 **Option 2: Custom Playground** (deployed endpoint)
 
@@ -223,17 +267,17 @@ tool responses as styled cards alongside the agent's final answer.
 
 **Try these example prompts** (click the buttons in the UI or paste):
 
-1. **EU PII** → GDPR routing:
-   > Classify and route: Customer Maria Schmidt, born 15 March 1988, Friedrichstrasse 42, 10117 Berlin, Germany. Tax ID: 12/345/67890. Requesting refund for duplicate charge on invoice #DE-2026-4411.
+1. **EU Health** → GDPR routing, DiffusionGemma escalation:
+   > Classify and route: Patient Maria Schmidt, Berlin. Diagnosis: Type 2 Diabetes. Prescription: Metformin 500mg.
 
-2. **US Health** → HIPAA + PII override:
-   > Classify and route: Patient John Doe, SSN 123-45-6789, DOB 07/22/1975. Blue Cross Blue Shield policy #BCBS-2026-99887. Diagnosis: Type 2 diabetes mellitus. Cleveland Clinic, Ohio.
+2. **US Health** → HIPAA + PII override, Laya handles alone:
+   > Classify and route: Patient John Smith, SSN 123-45-6789. Medicare ID: 1EG4-TE5-MK72. Diagnosis: Hypertension. Dr. Williams, Mayo Clinic, Rochester MN.
 
-3. **UK PII** → human review triggered:
-   > Classify and route: Account holder James Wilson, 42 Baker Street, London NW1 6XE. National Insurance Number: QQ 12 34 56 C. HSBC account ending 7891. Disputed direct debit of GBP 450.
+3. **UK Financial** → UK GDPR, DiffusionGemma corrects location:
+   > Classify and route: Account holder James Wilson, London. Barclays sort code 20-71-04, account 41298756. GBP 15,340.00 pension transfer.
 
 4. **Public data** → no restrictions:
-   > Classify and route: Q3 2026 Earnings Report for Acme Corp (NYSE: ACME). Revenue grew 12% YoY to $4.2B. Operating margin expanded to 18.5%.
+   > Classify and route: Open-source project README: 'This library is MIT-licensed. Install with pip install example-lib.'
 
 ### OpenShift Deployment
 
@@ -255,16 +299,16 @@ oc apply -f manifests/06-agent.yaml
 ```
 agent/
 ├── app/
-│   ├── agent.py                # Root agent — Gemini + Laya tool + policy + routing
+│   ├── agent.py                # Root agent — Gemini + decision models + policy + routing
 │   ├── model.py                # Gemini model configuration
-│   ├── prompt.py               # Orchestrator instructions (4-step pipeline)
+│   ├── prompt.py               # Orchestrator instructions (confidence gate + 4-step pipeline)
 │   ├── policy/                 # Deterministic routing engine
 │   │   ├── cards.py            # A2A Agent Cards with OpenEAGO metadata
 │   │   ├── engine.py           # Three-stage routing (residency → exclusion → score)
 │   │   └── models.py           # DataRequest, RoutingDecision
 │   ├── sub_agents/             # Regional processor agents (EU, UK, US)
 │   └── tools/
-│       ├── laya_tool.py        # Jev System 1 — 5 typed questions, 1 forward pass
+│       ├── laya_tool.py        # Jev-compatible — Laya fast + DiffusionGemma deep (confidence gated)
 │       ├── compliance_policy.py # Application policy — maps probabilities to decisions
 │       └── routing_tool.py     # Policy engine tool wrapper
 ├── tests/
@@ -277,17 +321,20 @@ agent/
 
 ## Key Design Decisions
 
-1. **The model answers "what is in the data?" — the policy answers "which law applies?"**  
-   Regulatory applicability is law, not text classification.  Laya detects PII and geography; the regime table maps (location × data_type) → regulation.
+1. **Two Jev-compatible models, one protocol — Laya for speed, DiffusionGemma for depth.**
+   Both speak `POST /v1/systemone` and answer the same five typed questions.  Laya runs first (~150ms).  If its `answer_confidence` on data_type or data_subject_location falls below the gate (0.55), DiffusionGemma 26B is called with the same questions for a deeper read (~1s).  This follows the confidence gating pattern from Laya Example 18.
 
-2. **PII override preserves the original data type for regime lookup.**  
+2. **The model answers "what is in the data?" — the policy answers "which law applies?"**
+   Regulatory applicability is law, not text classification.  The decision models detect PII and geography; the regime table maps (location × data_type) → regulation.
+
+3. **PII override preserves the original data type for regime lookup.**
    Health data with PII (pii_detected ≥ 0.70) gets classified as PII for routing, but the original type is preserved — US health stays HIPAA, not CCPA.
 
-3. **Low confidence triggers human review, not a fallback model.**  
-   When any signal is below its confidence floor, the system flags for human review rather than calling a different model.  The probabilities are the evidence; the human makes the call.
+4. **All five questions share one forward pass.**
+   Both models answer choice, noul, and score questions simultaneously — different heads on the same forward pass.  Adding a question costs one extra row in the batch, not another inference call.
 
-4. **All five questions share one forward pass.**  
-   Laya answers choice, noul, and score questions simultaneously — different heads on the same encoder pass.  Adding a question costs one extra row in the batch, not another inference call.
+5. **Gate on `answer_confidence`, not `confidence`.**
+   `answer_confidence` is the calibrated probability on the reported answer.  `confidence` is 1 minus normalised entropy — a different quantity that means different things on different question types.  A threshold carried over from one to the other does not transfer.
 
 ## RHOAI Features Used
 
