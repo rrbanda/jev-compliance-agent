@@ -1,10 +1,10 @@
 """FastAPI entrypoint for the Cross-Border Data Router agent.
 
-Follows the pattern from the Red Hat agentic-starter-kits ADK template:
-https://github.com/red-hat-data-services/agentic-starter-kits/tree/main/agents/google/templates/adk
-
-Provides an OpenAI-compatible /chat/completions endpoint so the agent
-can be consumed by any OpenAI client, plus a /health check.
+Serves two UIs and an API:
+  /        → ADK built-in playground (tool calls expanded natively)
+  /chat    → Custom chat playground (styled cards)
+  /chat/completions → OpenAI-compatible API
+  /health  → Health check
 """
 
 import json
@@ -20,6 +20,7 @@ from app.agent import create_agent
 from app.app_utils.telemetry import enable_tracing
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
@@ -58,15 +59,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runner = None
 
 
-app = FastAPI(
-    title="Cross-Border Data Router",
-    description=(
-        "ADK agent powered by Laya (System 1) and Gemini (System 2). "
-        "OpenAI-compatible /chat/completions endpoint."
-    ),
+# ── Main app: ADK playground at / ────────────────────────────────────
+# get_fast_api_app creates a full ADK server with the built-in web UI.
+# It reads the agent from the current directory (app/__init__.py).
+_AGENTS_DIR = str(Path(__file__).resolve().parent)
+
+app = get_fast_api_app(
+    agents_dir=_AGENTS_DIR,
+    web=True,
+    host="0.0.0.0",
+    port=int(getenv("PORT", "8080")),
     lifespan=lifespan,
+    allow_origins=["*"],
 )
 
+
+# ── OpenAI-compatible API endpoints ──────────────────────────────────
 
 def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -232,23 +240,14 @@ async def _handle_stream(user_content: str, model_id: str) -> StreamingResponse:
     )
 
 
-@app.get("/health")
-async def health():
-    ok = runner is not None
-    body = {"status": "healthy" if ok else "not_ready", "agent_initialized": ok}
-    if not ok:
-        return JSONResponse(status_code=503, content=body)
-    return body
-
-
-# ── Playground UI ────────────────────────────────────────────────────
+# ── Custom chat playground at /chat ──────────────────────────────────
 _BASE_DIR = Path(__file__).resolve().parent
 _PLAYGROUND_HTML = _BASE_DIR / "playground" / "templates" / "index.html"
 
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def playground():
-    """Serve the playground chat UI."""
+@app.get("/chat", response_class=HTMLResponse, include_in_schema=False)
+async def custom_playground():
+    """Serve the custom chat playground UI."""
     return FileResponse(
         _PLAYGROUND_HTML,
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
