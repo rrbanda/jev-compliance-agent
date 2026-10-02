@@ -72,18 +72,33 @@ flowchart TD
     style SYS1 fill:#f9fbe7,stroke:#9ccc65,stroke-width:2px,color:#33691e
 ```
 
-## Two Jev-compatible Models, One Protocol
+## Decision Models and the System One API
 
-Laya and DiffusionGemma are **not** Jev — they are separate open-source / research models that speak the same `POST /v1/systemone` wire protocol as TypeSafe's hosted Jev API.  Both return the same answer shapes (`choice`, `score`, `noul`) with calibrated probability distributions.  An existing Jev client just needs its `baseUrl` repointed.
+**Decision models** are a category of neural models that read an input state and a set of typed questions, then return a calibrated probability for every allowed answer — no free-form text, no reasoning tokens.  The protocol they share is the **System One API** (`POST /v1/systemone`), originated by [TypeSafe's Jev](https://www.typesafe.ai/) and now implemented by a growing ecosystem of open models:
+
+| Model | Maker | Size | Median Latency | Open Source |
+|---|---|---|---|---|
+| **Jev** | TypeSafe | proprietary | ~524 ms | No (hosted API) |
+| **Laya** | Community | 421M | ~33 ms | Yes (Apache 2.0) |
+| **DiffusionGemma** | Research | 26B (A4B active) | ~1 s | Research |
+| **Clef** | Cloudflare | 27B | ~209 ms | Yes (Apache 2.0) |
+| **Clef-flash** | Cloudflare | 9B | ~39 ms | Yes (Apache 2.0) |
+
+All return the same answer shapes (`choice`, `score`, `noul`) with calibrated probability distributions.  An existing Jev client — or any System One client — just needs its endpoint repointed; nothing else changes.
+
+This agent uses **two** of these models with confidence gating:
 
 | | Laya | DiffusionGemma |
 |---|---|---|
+| Role | Fast triage (every request) | Deep confirmation (confidence-gated) |
 | Parameters | 421M encoder | 26B (A4B active) |
 | Architecture | Non-autoregressive | Diffusion transformer |
-| Latency | ~150ms | ~1s |
+| Latency | ~150 ms | ~1 s |
 | Output tokens | 0 | 10 |
 | GPU | A10G | H200 MIG 3g.71gb |
 | When called | Every request | Only when Laya's confidence < 0.55 |
+
+Because they all speak the same protocol, you could swap in Clef, Clef-flash, or Jev as a backend by changing one URL — no code changes to the agent, policy, or prompt.
 
 ## The Question Schema
 
