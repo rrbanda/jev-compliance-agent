@@ -1,222 +1,187 @@
 # Cross-Border Data Router
 
-A three-tier AI agent for compliance-aware data routing in regulated industries.  
-**System 1** (instant neural classification) + **System 2** (LLM reasoning) + **deterministic policy engine**.
+A compliance-aware data routing agent that combines **calibrated neural classification** (Laya) with **LLM reasoning** (Gemini) and a **deterministic policy engine**.
+
+The key idea: Laya answers five typed questions in one forward pass (~145ms, zero generated tokens).  An application policy maps those calibrated probabilities to routing decisions.  Gemini explains the result.  The model provides the signal; the policy provides the decision.
 
 ## The Problem
 
 Financial institutions processing data across borders face cascading regulatory requirements:
 
-- **GDPR (EU)**: Personal data of EU residents cannot leave the EU/EEA without adequacy decisions or binding corporate rules.  Violations carry fines up to 4% of global annual revenue.
-- **CCPA (US)**: California consumers can opt out of cross-border data sales.  Enforcement actions have reached eight-figure settlements.
-- **Conflicting obligations**: A German customer's financial records may simultaneously require EU residency (GDPR), US reporting (SEC/FATCA), and contractual restrictions that forbid certain jurisdictions entirely.
+- **GDPR (EU)**: Personal data of EU residents cannot leave the EU/EEA without adequacy decisions.  Fines up to 4% of global annual revenue.
+- **HIPAA (US)**: Protected health information must stay in approved jurisdictions.
+- **CCPA (US)**: California consumers' personal data has transfer restrictions.
+- **Conflicting obligations**: A German customer's health records may simultaneously require EU residency (GDPR), US reporting (FATCA), and contractual restrictions forbidding certain jurisdictions.
 
-Current approaches fail because they rely on either:
-- **Manual classification** — slow, error-prone, doesn't scale to real-time transaction volumes.
-- **LLM-only classification** — generative models hallucinate categories, produce uncalibrated confidence scores, and take seconds per request.
+Current approaches fail because:
+- **Manual classification** is slow, error-prone, and doesn't scale.
+- **LLM-only classification** hallucinates categories, produces uncalibrated confidence, and takes seconds per request.
 
-Neither provides the **auditable probability distributions** that compliance teams need to justify routing decisions to regulators.
+Neither provides **auditable probability distributions** that compliance teams need.
 
-## The Solution
-
-This demo separates the problem into three tiers, each using the right tool:
+## How It Works
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                  Gemini 2.5 Flash (System 2)                      │
-│          "Reason about the routing decision"                      │
-│          Google AI API — no on-cluster GPU needed                 │
-└──────────────┬──────────────────────────┬────────────────────────┘
-               │                          │
-      ┌────────▼────────┐       ┌────────▼─────────┐
-      │  Laya (Fast)    │       │ DiffusionGemma   │
-      │  System 1a      │       │ System 1b        │
-      │  421M encoder   │       │ 26B diffusion    │
-      │  CPU, ~145ms    │       │ H200 MIG, ~10-26s│
-      │  /v1/systemone  │       │ /v1/systemone    │
-      └────────┬────────┘       └────────┬─────────┘
-               │   Same Jev protocol     │
-               └──────────┬──────────────┘
-                          │
-                  ┌───────▼───────┐
-                  │ Policy Engine │
-                  │ A2A + OpenEAGO│
-                  │ Deterministic │
-                  └───────┬───────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-       EU Agent       UK Agent       US Agent
-      (Frankfurt)    (London)       (Iowa)
+┌─────────────────────────────────────────────────────────────┐
+│                     User Request                             │
+│  "Route this: Maria Schmidt, Berlin, Tax ID 12/345/67890"   │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+     Step 1   ▼   ONE Jev call, FIVE typed questions, ONE forward pass
+┌─────────────────────────────────────────────────────────────┐
+│                    Laya (System 1)                            │
+│  421M encoder · ~145ms · 0 output tokens · non-autoregressive│
+│                                                              │
+│  data_type           choice → financial (0.70)               │
+│  pii_detected        noul   → 0.33                           │
+│  data_subject_location choice → EU (0.57)                    │
+│  sensitivity         score  → 1.72 / 3                       │
+│  needs_human_review  noul   → 0.17                           │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+     Step 2   ▼   Deterministic rules, tuneable thresholds
+┌─────────────────────────────────────────────────────────────┐
+│               Application Policy                             │
+│                                                              │
+│  PII override:  pii_detected=0.33 < 0.70 → no override      │
+│  Regime table:  EU + financial → GDPR                        │
+│  Residency:     EU/EEA required                              │
+│  Excluded:      CHINA, RUSSIA                                │
+│  Human review:  not needed (all signals clear)               │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+     Step 3   ▼   A2A Agent Cards + OpenEAGO geographic metadata
+┌─────────────────────────────────────────────────────────────┐
+│               Routing Engine                                 │
+│  Residency filter → Exclusion filter → Score → EU Agent ✓   │
+└─────────────┬───────────────────────────────────────────────┘
+              │
+     Step 4   ▼   Gemini reasons about the whole pipeline
+┌─────────────────────────────────────────────────────────────┐
+│               Gemini 2.5 Flash (System 2)                    │
+│  Explains: "Classified as financial data for an EU subject.  │
+│  GDPR applies. Routed to EU Agent (Frankfurt). No human      │
+│  review needed — all confidence thresholds met."             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-| Component | Role | Hardware | Latency |
-|---|---|---|---|
-| **Laya** | System 1a — fast neural classification.  Purpose-built encoder that outputs calibrated probability distributions.  Cannot hallucinate. | CPU (or GPU) | ~145ms |
-| **DiffusionGemma 26B** | System 1b — deep analysis.  Diffusion transformer with structured-read mode.  Denoises a fixed token canvas and reads the answer distribution. | H200 MIG 3g.71gb | ~10-26s |
-| **Gemini 2.5 Flash** | System 2 — reasoning.  Interprets the System 1 classification, applies business rules, and decides which regional agent to route to. | Google AI API | ~1-3s |
-| **Policy Engine** | Deterministic three-stage filter: data-residency → jurisdiction-exclusion → scoring.  Uses A2A Agent Cards with OpenEAGO geographic metadata. | CPU (in-process) | <1ms |
+## The Jev Question Schema
 
-### Why two System 1 engines?
+The five questions are answered **simultaneously** in one forward pass.  Each uses the right question type for its answer shape:
 
-Both Laya and DiffusionGemma speak the **same Jev `/v1/systemone` wire protocol** — the agent calls a single tool and the backend is selected automatically:
-
-- **`auto` mode** (default): Laya classifies in ~145ms.  If confidence < 80%, DiffusionGemma is also called for a deeper read.  Both results are returned.
-- **`fast` mode**: Laya only — for latency-sensitive real-time routing.
-- **`deep` mode**: DiffusionGemma only — for audit-grade analysis.
-
-This mirrors a real operational pattern: **fast triage** for volume, **deep confirmation** for compliance evidence.
-
-## What is the Jev Protocol?
-
-Jev treats a model as a **decision function**, not a text generator.  Instead of asking "What type of data is this?" and parsing prose, Jev sends structured questions and gets back **typed answers with probabilities**:
-
-```json
-{
-  "state": "Hans Mueller, Bahnhofstrasse 42, Berlin. Account DE89370400...",
-  "questions": {
-    "data_type": {
-      "type": "choice",
-      "instructions": "What type of sensitive data is present?",
-      "options": ["PII", "financial", "health", "public"]
+```python
+COMPLIANCE_QUESTIONS = {
+    "data_type": {                          # What kind of data?
+        "type": "choice",
+        "criteria": {
+            "PII": "names, addresses, national IDs, tax IDs",
+            "financial": "account numbers, transactions, invoices",
+            "health": "diagnoses, treatment plans, insurance claims",
+            "public": "non-sensitive public information",
+        },
     },
-    "has_pii": {
-      "type": "noul",
-      "instructions": "Does this record contain PII?"
+    "pii_detected": {                       # Contains PII?
+        "type": "noul",                     # Returns probability 0.0–1.0
     },
-    "needs_human_review": {
-      "type": "noul",
-      "instructions": "Should a human compliance officer review this?"
-    }
-  }
+    "data_subject_location": {              # Where is the person?
+        "type": "choice",
+        "criteria": {"EU": "...", "UK": "...", "US": "...", "other": "..."},
+    },
+    "sensitivity": {                        # How sensitive?
+        "type": "score",                    # Ordered scale 0–3
+        "criteria": ["public", "internal", "confidential", "restricted"],
+    },
+    "needs_human_review": {                 # Ambiguous?
+        "type": "noul",
+    },
 }
 ```
 
-Response:
-```json
-{
-  "answers": {
-    "data_type": {"choice": "PII", "probabilities": {"PII": 0.94, "financial": 0.04, "health": 0.01, "public": 0.01}},
-    "has_pii":   {"noul": 0.97},
-    "needs_human_review": {"noul": 0.23}
-  }
+The probabilities are **calibrated** — when Laya says 0.94, the true positive rate is approximately 94%.  This is what compliance requires: not "the AI said PII", but "94% probability of PII exceeding our 70% threshold".
+
+## The Application Policy
+
+The model reads the data.  The policy applies the law.  This separation is what makes the system auditable and adaptable:
+
+```python
+# The model tells us WHERE and WHAT.  The law tells us the rest.
+_REGIME_TABLE = {
+    ("EU", "PII"):    ("GDPR",    ["EU", "EEA"], ["US", "CHINA", "RUSSIA"]),
+    ("EU", "health"): ("GDPR",    ["EU", "EEA"], ["US", "CHINA", "RUSSIA"]),
+    ("UK", "PII"):    ("UK_GDPR", ["UK", "EU"],  ["CHINA", "RUSSIA"]),
+    ("US", "health"): ("HIPAA",   ["US"],         ["CHINA", "RUSSIA"]),
+    ("US", "PII"):    ("CCPA",    ["US"],         []),
+    # ... swap the policy without retraining the model
 }
+
+# Tuneable thresholds — raise to be more conservative
+PII_THRESHOLD        = 0.70   # above → treat as PII
+REVIEW_THRESHOLD     = 0.60   # above → flag for human review
+SENSITIVITY_FLOOR    = 2.5    # above → mandatory escalation
+CONFIDENCE_FLOOR     = 0.50   # below → escalate for low confidence
 ```
 
-Three question types:
-- **`noul`** (yes/no): Returns a probability 0.0–1.0.  "Is this PII?" → 0.97.
-- **`choice`** (categorical): Returns a distribution over options.  "What type?" → {PII: 0.94, financial: 0.04, ...}.
-- **`score`** (ordered scale): Returns a distribution over levels.  "Risk tier?" → {low: 0.1, medium: 0.3, high: 0.6}.
-
-The probabilities are **calibrated** — when Laya says 0.94, the true positive rate across similar inputs is approximately 94%.  This is what regulators want: not "the AI said PII", but "the AI assigned 94% probability to PII, which exceeds our 80% routing threshold."
-
-## Architecture Details
-
-### Laya DecisionModel
-
-Laya is a 421M-parameter encoder that was purpose-built for decision tasks:
-
-```mermaid
-graph LR
-    A[Input Text] --> B[ModernBERT-large Encoder]
-    B --> C["[MASK] markers per option"]
-    C --> D[2-layer TransformerEncoder Decision Head]
-    D --> E["Scorer: LayerNorm → Linear → GELU → Linear"]
-    E --> F[Softmax → Calibrated Probabilities]
-    D --> G["Act Head: should I act on this?"]
-```
-
-Key architectural choices:
-- **MASK-marker probing**: Each answer option gets a `[MASK]` token.  The model scores all options in one bidirectional forward pass — no autoregressive generation.
-- **Variable options at inference**: The number of choices can differ between requests without retraining.
-- **RL training**: Trained with strictly proper scoring rules (log score + spherical score + ranked probability score) that incentivize calibrated distributions, not just correct labels.
-- **Act head**: A separate head that answers "should I act on this at all?" — the abstention signal.
-
-### DiffusionGemma 26B-A4B
-
-DiffusionGemma is a 26B-parameter Mixture-of-Experts diffusion transformer (4B active parameters per token):
-
-- **Structured-read mode**: vLLM pins an answer template on a fixed token canvas, denoises it in parallel, and reads the distribution at the answer slots.
-- **Multi-sample averaging**: Each answer averages over multiple noise draws for stability.
-- **Auto-sampling**: When entropy is high, additional reads are taken automatically.
-- Deployed via the upstream `structured_server.py` as a sidecar to the vLLM engine.
-
-### Policy Engine
-
-The routing policy is a deterministic three-stage filter based on the [OpenEAGO](https://openeago.finos.org/) framework:
-
-1. **Residency filter**: Eliminate any agent whose declared `data_residency_regions` doesn't cover all regions the request requires.
-2. **Jurisdiction-exclusion filter**: Eliminate any agent whose jurisdiction is on the request's excluded list.
-3. **Scoring**: Rank survivors by jurisdiction preference (70%) and compliance-tag overlap (30%).
-
-Hard filters run before scoring and **never get overridden** — a non-compliant agent cannot out-score its way into eligibility.  If nothing survives, the request is rejected outright with an escalation recommendation.
-
-Agent capabilities are declared via [A2A](https://github.com/google/A2A) `AgentCard` objects with OpenEAGO geographic metadata extensions.
-
-### Infrastructure
-
-```mermaid
-graph TB
-    subgraph "OpenShift (A10G Cluster)"
-        AGENT["ADK Agent<br/>Python + FastAPI"]
-        LAYA["Laya DecisionModel<br/>KServe InferenceService"]
-        POLICY["Policy Engine<br/>(in-process)"]
-        AGENT --> LAYA
-        AGENT --> POLICY
-    end
-    subgraph "OpenShift (H200 Cluster)"
-        DGEMMA["DiffusionGemma 26B<br/>vLLM + structured_server<br/>MIG 3g.71gb"]
-    end
-    subgraph "Google AI"
-        GEMINI["Gemini 2.5 Flash"]
-    end
-    AGENT --> DGEMMA
-    AGENT --> GEMINI
-```
+When a regulation changes, update the table — no model retraining, no redeployment of inference services.
 
 ## Demo Scenarios
 
-### 1. EU PII — Fast Path (Laya only)
+### 1. EU Financial — Clean Routing
 
-> "Classify and route: Hans Mueller, Bahnhofstrasse 42, Berlin. Date of birth 1985-03-15. Tax ID DE123456789."
+> "Route: Maria Schmidt, Berlin, Germany. Tax ID 12/345/67890. Invoice refund."
 
-- Laya classifies as **PII** with 94% confidence in ~145ms
-- Policy engine routes to **EU Agent** (Frankfurt) — GDPR compliant
-- No DiffusionGemma escalation needed (confidence > 80%)
+| Question | Answer | Probability |
+|---|---|---|
+| data_type | financial | 0.70 |
+| pii_detected | — | 0.33 |
+| location | EU | 0.57 |
+| sensitivity | — | 1.72 |
+| needs_review | — | 0.17 |
 
-### 2. Ambiguous Record — Auto-Escalation
+**Policy**: EU + financial → GDPR → route to EU Agent.  165ms.
 
-> "Classify and route: Transaction ref TXN-2026-441. Amount: 5,200 EUR. Note: medical equipment purchase for patient care facility in Munich."
+### 2. US Health + PII Override
 
-- Laya classifies as **financial** with 72% confidence — below 80% threshold
-- DiffusionGemma is auto-called: confirms **financial** at 85%, also flags `has_pii: 0.31` and `needs_human_review: 0.67`
-- Agent notes the dual classification and routes to EU Agent with a human-review recommendation
+> "Route: Patient John Doe, SSN 123-45-6789. Diagnosis: Type 2 diabetes. Cleveland Clinic, Ohio."
 
-### 3. Cross-Border Conflict
+| Question | Answer | Probability |
+|---|---|---|
+| data_type | health | 0.84 |
+| pii_detected | — | **0.78** |
+| location | US | 0.62 |
+| sensitivity | — | 1.57 |
+| needs_review | — | 0.18 |
 
-> "Route this record: US-based bank account statement for a German national residing in France. Contains SSN, IBAN, and tax residency declarations. Must comply with both FATCA and GDPR. Cannot be processed in China or Russia."
+**Policy**: pii_detected (0.78) ≥ 0.70 → PII override.  But original data_type was health → HIPAA still applies (not CCPA).  Route to US Agent.  140ms.
 
-- Laya classifies as **PII** with 91% confidence
-- Policy engine applies GDPR → requires EU residency, excludes US
-- But FATCA requires US reporting — **conflict detected**
-- Policy rejects with escalation: "No agent satisfies both EU residency and US reporting. Escalate for human review."
+### 3. UK PII — Human Review Triggered
 
-### 4. Deep Analysis Mode
+> "Route: James Wilson, 42 Baker Street, London NW1 6XE. NI Number: QQ 12 34 56 C. HSBC account. GBP 450 disputed."
 
-> "I need a thorough compliance analysis: Patient records from Berlin hospital, including diagnoses, treatment plans, and insurance claim IDs. Use deep analysis."
+| Question | Answer | Probability |
+|---|---|---|
+| data_type | financial | 0.94 |
+| pii_detected | — | **0.57** |
+| location | UK | **0.48** (other: 0.33) |
+| sensitivity | — | 1.57 |
+| needs_review | — | 0.21 |
 
-- Agent calls `classify_with_laya(text, backend="deep")` — explicitly requests DiffusionGemma
-- DiffusionGemma returns: `health: 0.91, PII: 0.87, needs_human_review: 0.82`
-- Agent recommends EU routing with mandatory human review (health + PII combined)
+**Policy**: Location confidence (0.48) is borderline.  pii_detected (0.57) conflicts with data_type=financial.  → **Human review required**.  Route to UK Agent but flag for compliance officer review.  145ms.
+
+### 4. Public Data — No Restrictions
+
+> "Route: Q3 2026 Earnings Report, Acme Corp (NYSE: ACME). Revenue $4.2B."
+
+| Question | Answer | Probability |
+|---|---|---|
+| data_type | financial | **0.94** |
+| pii_detected | — | 0.05 |
+| location | other | **0.79** |
+| sensitivity | — | 1.80 |
+| needs_review | — | 0.16 |
+
+**Policy**: No specific location + no PII → no regime → route anywhere.  143ms.
 
 ## Setup
-
-### Prerequisites
-
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) for dependency management
-- A [Gemini API key](https://aistudio.google.com/apikey)
-- Access to Laya and DiffusionGemma endpoints (or run with `SYSTEM1_MODE=fast` for Laya only)
 
 ### Local Development
 
@@ -232,76 +197,66 @@ uv run adk web .   # Opens ADK playground at http://localhost:8000
 ### OpenShift Deployment
 
 ```bash
-# 1. Create secrets
+# Create secrets
 oc create secret generic gemini-apikey -n laya-demo \
   --from-literal=api_key=<YOUR_GEMINI_KEY>
 
-# 2. Build the agent image
+# Build the agent image
 oc new-build --binary --name=cbdr-agent -n laya-demo
 cd agent && oc start-build cbdr-agent --from-dir=. -n laya-demo --follow
 
-# 3. Deploy
+# Deploy
 oc apply -f manifests/06-agent.yaml
-```
-
-### DiffusionGemma on H200 MIG
-
-```bash
-# Prerequisites: booked MIG 3g.71gb slot, HuggingFace token
-
-# 1. Create secrets
-oc create secret generic hf-token -n user-rbanda \
-  --from-literal=HF_TOKEN=<YOUR_HF_TOKEN>
-oc create configmap dgemma-structured-server -n user-rbanda \
-  --from-file=structured_server.py=manifests/structured_server.py
-
-# 2. Deploy
-oc apply -f manifests/07-diffusiongemma.yaml
 ```
 
 ## Project Structure
 
 ```
-laya-rhoai-demo/
-├── agent/                      # ADK agent application
-│   ├── app/
-│   │   ├── agent.py            # Root agent with dual System 1 + policy tools
-│   │   ├── model.py            # Gemini model configuration
-│   │   ├── prompt.py           # Orchestrator instructions
-│   │   ├── policy/             # Deterministic routing engine
-│   │   │   ├── cards.py        # A2A Agent Cards with OpenEAGO metadata
-│   │   │   ├── engine.py       # Three-stage routing policy
-│   │   │   └── models.py       # Data shapes (DataRequest, RoutingDecision)
-│   │   ├── sub_agents/         # Regional processor agents (EU, UK, US)
-│   │   └── tools/
-│   │       ├── laya_tool.py    # Dual-backend Jev System 1 tool
-│   │       └── routing_tool.py # Policy engine tool wrapper
-│   ├── playground/             # Chat UI
-│   ├── tests/
-│   ├── Dockerfile
-│   └── pyproject.toml
-├── manifests/
-│   ├── 00-namespace.yaml       # laya-demo namespace
-│   ├── 01-pvcs.yaml            # Model storage
-│   ├── 02-build.yaml           # OpenShift BuildConfig
-│   ├── 03-serving-runtimes.yaml # KServe vLLM runtimes
-│   ├── 04-inference-services.yaml # Laya InferenceService
-│   ├── 05-routes.yaml          # External routes
-│   ├── 06-agent.yaml           # Agent Deployment + Service + Route
-│   └── 07-diffusiongemma.yaml  # DiffusionGemma on H200 MIG
-└── README.md
+agent/
+├── app/
+│   ├── agent.py                # Root agent — Gemini + Laya tool + policy + routing
+│   ├── model.py                # Gemini model configuration
+│   ├── prompt.py               # Orchestrator instructions (4-step pipeline)
+│   ├── policy/                 # Deterministic routing engine
+│   │   ├── cards.py            # A2A Agent Cards with OpenEAGO metadata
+│   │   ├── engine.py           # Three-stage routing (residency → exclusion → score)
+│   │   └── models.py           # DataRequest, RoutingDecision
+│   ├── sub_agents/             # Regional processor agents (EU, UK, US)
+│   └── tools/
+│       ├── laya_tool.py        # Jev System 1 — 5 typed questions, 1 forward pass
+│       ├── compliance_policy.py # Application policy — maps probabilities to decisions
+│       └── routing_tool.py     # Policy engine tool wrapper
+├── tests/
+│   └── unit/
+│       ├── test_compliance_policy.py  # 13 policy rule tests
+│       └── test_tools.py              # Routing tool + sub-agent tests
+├── Dockerfile
+└── pyproject.toml
 ```
+
+## Key Design Decisions
+
+1. **The model answers "what is in the data?" — the policy answers "which law applies?"**  
+   Regulatory applicability is law, not text classification.  Laya detects PII and geography; the regime table maps (location × data_type) → regulation.
+
+2. **PII override preserves the original data type for regime lookup.**  
+   Health data with PII (pii_detected ≥ 0.70) gets classified as PII for routing, but the original type is preserved — US health stays HIPAA, not CCPA.
+
+3. **Low confidence triggers human review, not a fallback model.**  
+   When any signal is below its confidence floor, the system flags for human review rather than calling a different model.  The probabilities are the evidence; the human makes the call.
+
+4. **All five questions share one forward pass.**  
+   Laya answers choice, noul, and score questions simultaneously — different heads on the same encoder pass.  Adding a question costs one extra row in the batch, not another inference call.
 
 ## RHOAI Features Used
 
-| Feature | How it's used |
+| Feature | Usage |
 |---|---|
-| **KServe InferenceService** | Serves Laya DecisionModel with RawDeployment mode and custom ServingRuntime |
-| **NVIDIA GPU Operator** | Manages A10G GPUs for Laya inference |
-| **MIG Partitioning** | H200 MIG 3g.71gb slice for DiffusionGemma |
+| **KServe InferenceService** | Serves Laya with RawDeployment mode |
+| **NVIDIA GPU Operator** | Manages GPU allocation |
 | **Kueue** | GPU workload admission with booking-based quotas |
 | **OpenShift BuildConfig** | Binary Docker builds for the agent container |
-| **Routes** | TLS-terminated external access to all endpoints |
+| **Routes** | TLS-terminated external access |
 
 ## License
 

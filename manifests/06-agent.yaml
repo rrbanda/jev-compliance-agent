@@ -1,9 +1,9 @@
 # Cross-Border Data Router Agent — Deployment on OpenShift
 #
-# Three-tier architecture:
-#   System 1a: Laya (fast, CPU, ~145ms)
-#   System 1b: DiffusionGemma 26B (deep, H200 MIG, ~10-26s)
-#   System 2:  Gemini (reasoning LLM, hosted API)
+# Two-tier architecture:
+#   System 1: Laya (5 typed questions, 1 forward pass, ~145ms)
+#   System 2: Gemini (reasoning LLM, hosted API)
+#   Policy:   Deterministic compliance rules (in-process)
 #
 # Prerequisites:
 #   1. Create the Gemini API key secret:
@@ -50,17 +50,9 @@ spec:
                   key: api_key
             - name: MODEL_NAME
               value: "gemini-2.5-flash"
-            # Laya (System 1a — fast decision engine)
+            # Laya (System 1 — Jev decision engine)
             - name: LAYA_API_URL
               value: "https://laya-api-gpu-laya-demo.apps.ocp.qn6c5.sandbox1388.opentlc.com"
-            # DiffusionGemma (System 1b — deep decision engine)
-            - name: DIFFUSIONGEMMA_API_URL
-              value: "https://dgemma-jev-user-rbanda.apps.ocp.cloud.rhai-tmm.dev"
-            # System 1 routing: auto = Laya first, escalate if low confidence
-            - name: SYSTEM1_MODE
-              value: "auto"
-            - name: SYSTEM1_CONFIDENCE_THRESHOLD
-              value: "0.80"
             # MLflow Tracing (set URI to enable; leave commented to disable)
             # - name: MLFLOW_TRACKING_URI
             #   value: "https://mlflow-laya-demo.apps.ocp.<cluster>"

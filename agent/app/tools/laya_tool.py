@@ -1,25 +1,19 @@
-"""Dual-backend Jev System 1 decision tool.
+"""Jev System 1 compliance classification tool.
 
-Both Laya and DiffusionGemma speak the same Jev ``/v1/systemone`` wire
-protocol, so the agent gets a single tool that can target either backend:
+One call, five typed questions, one forward pass, zero output tokens.
+Returns calibrated probabilities that feed directly into the application
+policy (``compliance_policy.py``) — the model provides the signal, the
+policy provides the decision.
 
-  - **fast** → Laya (421M encoder, CPU, ~145ms): purpose-built decision
-    model that cannot hallucinate — outputs calibrated probability
-    distributions directly from a bidirectional encoder.
-  - **deep** → DiffusionGemma 26B-A4B (H200 MIG, ~10-26s): diffusion
-    transformer with structured-read mode.  Denoises a fixed token canvas
-    in parallel; vLLM's structured-read pins an answer template and reads
-    the distribution at the answer slots.
-  - **auto** → calls Laya first; if the top-choice confidence is below a
-    threshold (default 0.80), escalates to DiffusionGemma for a deeper
-    read.  Returns both results so the agent (and the audit log) can see
-    the fast triage and the deep confirmation side by side.
+Question design follows Laya's own preset patterns (``laya.presets``):
+  - Names the state field in backticks so the encoder reads the right key.
+  - Mixes ``choice``, ``noul`` and ``score`` in one pass — different heads
+    on the same encoder forward pass, no extra cost per question.
+  - Criteria worded to be mutually exclusive and to share vocabulary with
+    the data records the tool will see.
 
-The Jev request/response shapes are identical for both backends.  The
-``questions`` schema uses three Jev types:
-  - ``noul`` (yes/no with probability): "Is this PII?", "Needs human review?"
-  - ``choice`` (categorical with distribution): "What data type?"
-  - ``score`` (ordered scale): "Risk tier?"
+See ``examples/30_custom_schema_design.py`` in the Laya repo for the
+design rationale behind these choices.
 """
 
 from __future__ import annotations
@@ -37,233 +31,175 @@ LAYA_URL = os.getenv(
     "LAYA_API_URL",
     "https://laya-api-gpu-laya-demo.apps.ocp.qn6c5.sandbox1388.opentlc.com",
 )
-DIFFUSIONGEMMA_URL = os.getenv(
-    "DIFFUSIONGEMMA_API_URL",
-    "https://dgemma-jev-user-rbanda.apps.ocp.cloud.rhai-tmm.dev",
-)
-SYSTEM1_MODE = os.getenv("SYSTEM1_MODE", "auto")
-CONFIDENCE_THRESHOLD = float(os.getenv("SYSTEM1_CONFIDENCE_THRESHOLD", "0.80"))
 
-# ── Jev question schemas ────────────────────────────────────────────
-# Shared between both backends — same wire format.
+# ── Jev question schema ─────────────────────────────────────────────
+# Five questions, mixed types, answered in one forward pass.
+# The backtick convention (`record`) tells the encoder which state key
+# to read — same pattern as laya.triage_questions() uses `message`.
 
-_LAYA_QUESTIONS: dict[str, Any] = {
+COMPLIANCE_QUESTIONS = {
     "data_type": {
         "type": "choice",
-        "instructions": (
-            "What type of sensitive data is present in this record?"
-        ),
+        "instructions": "What type of sensitive data is present in `record`?",
         "criteria": {
-            "PII": {
-                "description": (
-                    "Personal identifiable information such as "
-                    "names, addresses, dates of birth, or ID numbers"
-                ),
-            },
-            "financial": {
-                "description": (
-                    "Financial records, transactions, account "
-                    "numbers, or monetary data"
-                ),
-            },
-            "health": {
-                "description": (
-                    "Medical or health records, diagnoses, "
-                    "treatment plans, or insurance claims"
-                ),
-            },
-            "public": {
-                "description": (
-                    "Non-sensitive public information with no "
-                    "regulatory restrictions"
-                ),
-            },
+            "PII": "personal identifiable information: names, addresses, "
+                   "dates of birth, national ID numbers, tax IDs",
+            "financial": "financial records: account numbers, transactions, "
+                         "invoices, monetary amounts, payment data",
+            "health": "medical or health records: diagnoses, treatment plans, "
+                      "prescriptions, insurance claims, patient IDs",
+            "public": "non-sensitive public information with no regulatory "
+                      "restrictions on storage or transfer",
         },
     },
-    "has_pii": {
+    "pii_detected": {
         "type": "noul",
-        "instructions": (
-            "Does this record contain personally identifiable information?"
-        ),
+        "instructions": "Does `record` contain personally identifiable "
+                        "information such as names, addresses, national IDs, "
+                        "or dates of birth?",
+        "criteria": {
+            "true": "contains one or more PII elements that identify a "
+                    "natural person",
+            "false": "no information that identifies a natural person",
+        },
     },
-}
-
-_DIFFUSIONGEMMA_QUESTIONS: dict[str, Any] = {
-    "data_type": {
+    "data_subject_location": {
         "type": "choice",
-        "instructions": (
-            "What type of sensitive data is present in this record?"
-        ),
-        "options": [
-            {"name": "PII", "description": "Personal identifiable information"},
-            {"name": "financial", "description": "Financial records or monetary data"},
-            {"name": "health", "description": "Medical or health records"},
-            {"name": "public", "description": "Non-sensitive public information"},
-        ],
+        "instructions": "Where is the data subject in `record` located?",
+        "criteria": {
+            "EU": "European Union or EEA country — Germany, France, "
+                  "Netherlands, Italy, Spain, Austria, Belgium, etc.",
+            "UK": "United Kingdom — England, Scotland, Wales, "
+                  "Northern Ireland, London, GBP, NHS",
+            "US": "United States — any US state or territory, "
+                  "USD, SSN, ZIP code",
+            "other": "none of the above, or location is not stated",
+        },
     },
-    "has_pii": {
-        "type": "noul",
-        "instructions": (
-            "Does this record contain personally identifiable information "
-            "such as names, addresses, or ID numbers?"
-        ),
+    "sensitivity": {
+        "type": "score",
+        "instructions": "How sensitive is the data in `record`?",
+        "criteria": [
+            "public: no restrictions on storage or transfer",
+            "internal: not for public release but no regulatory burden",
+            "confidential: subject to regulatory controls, breach notification required",
+            "restricted: highest sensitivity, legal liability if mishandled",
+        ],
     },
     "needs_human_review": {
         "type": "noul",
-        "instructions": (
-            "Is this record ambiguous enough that a human compliance "
-            "officer should review the classification before routing?"
-        ),
+        "instructions": "Is `record` ambiguous enough that a human "
+                        "compliance officer should review the classification "
+                        "before it is routed?",
+        "criteria": {
+            "true": "the record mixes data types, names multiple "
+                    "jurisdictions, or contains conflicting signals",
+            "false": "the classification is straightforward",
+        },
     },
 }
 
 
-def _call_jev(
-    url: str, text: str, questions: dict, timeout: float = 30.0
-) -> dict[str, Any]:
-    """Fire a Jev /v1/systemone request and return the raw response."""
-    resp = httpx.post(
-        f"{url}/v1/systemone",
-        json={
-            "model": "jev-latest",
-            "state": text,
-            "questions": questions,
-        },
-        timeout=timeout,
-        verify=False,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def classify_with_laya(record_text: str) -> dict:
+    """Classify a data record for cross-border compliance routing.
 
+    Makes one Jev ``/v1/systemone`` call with five typed questions — all
+    answered in a single forward pass (~145 ms on CPU, ~28 ms on GPU).
+    Zero output tokens: Laya is non-autoregressive and returns calibrated
+    probability distributions, not generated text.
 
-def _parse_laya_result(raw: dict) -> dict[str, Any]:
-    """Normalise a Laya Jev response into the tool's return shape."""
-    answers = raw.get("answers", {})
-    data_type = answers.get("data_type", {})
-    has_pii = answers.get("has_pii", {})
+    The five answers are:
 
-    classification = data_type.get("choice", "unknown")
-    probabilities = data_type.get("probabilities", {})
-    confidence = max(probabilities.values()) if probabilities else 0.0
-    pii_prob = has_pii.get("noul", has_pii.get("choice", 0.0))
-    if isinstance(pii_prob, str):
-        pii_prob = 1.0 if pii_prob == "yes" else 0.0
+    - ``data_type`` (choice): PII / financial / health / public — with a
+      probability distribution over all four.
+    - ``pii_detected`` (noul): probability 0.0–1.0 that the record
+      contains personally identifiable information.
+    - ``data_subject_location`` (choice): EU / UK / US / other — where
+      the data subject is located, with probability distribution.
+    - ``sensitivity`` (score): ordered scale from public (0) to
+      restricted (3), with a probability distribution.
+    - ``needs_human_review`` (noul): probability that a human compliance
+      officer should review before routing.
 
-    return {
-        "data_classification": classification,
-        "has_pii": pii_prob > 0.5 if isinstance(pii_prob, (int, float)) else pii_prob == "yes",
-        "pii_probability": float(pii_prob) if isinstance(pii_prob, (int, float)) else None,
-        "confidence": round(confidence, 4),
-        "probabilities": probabilities,
-    }
-
-
-def _parse_diffusiongemma_result(raw: dict) -> dict[str, Any]:
-    """Normalise a DiffusionGemma Jev response into the tool's return shape."""
-    answers = raw.get("answers", {})
-    data_type = answers.get("data_type", {})
-    has_pii = answers.get("has_pii", {})
-    needs_review = answers.get("needs_human_review", {})
-
-    classification = data_type.get("choice", "unknown")
-    probabilities = data_type.get("probabilities", {})
-    confidence_val = data_type.get("confidence", 0.0)
-    if not confidence_val and probabilities:
-        confidence_val = max(probabilities.values())
-    pii_noul = has_pii.get("noul", 0.0)
-    review_noul = needs_review.get("noul", None)
-
-    return {
-        "data_classification": classification,
-        "has_pii": pii_noul > 0.5,
-        "pii_probability": round(pii_noul, 4),
-        "confidence": round(confidence_val, 4),
-        "probabilities": probabilities,
-        "needs_human_review": round(review_noul, 4) if review_noul is not None else None,
-    }
-
-
-def classify_with_laya(text: str, backend: str = "auto") -> dict:
-    """Classify a data record using the Jev System 1 decision engine(s).
-
-    Both backends speak the same Jev ``/v1/systemone`` protocol.  The
-    ``backend`` parameter selects which to call:
-
-    - ``"fast"`` — Laya only (421M encoder, ~145ms on CPU).
-    - ``"deep"`` — DiffusionGemma only (26B diffusion model, ~10-26s on
-      H200 MIG).
-    - ``"auto"`` (default) — calls Laya first; if the top-choice
-      confidence is below 0.80, also calls DiffusionGemma and returns
-      both results for the agent to compare.
+    These probabilities feed the application policy, not the other way
+    around — the model provides the signal, you set the thresholds.
 
     Args:
-        text: The data record or description to classify.
-        backend: Which System 1 engine to use: ``"fast"``, ``"deep"``,
-            or ``"auto"``.
+        record_text: The data record or description to classify.
 
     Returns:
-        A dict with ``data_classification``, ``has_pii``, ``confidence``,
-        ``probabilities``, the ``backend`` used, ``latency_ms``, and
-        (when auto-escalated) a ``deep_result`` with the DiffusionGemma
-        confirmation.
+        A dict with all five typed answers, their probabilities, the
+        backend used, and latency in milliseconds.
     """
-    mode = backend if backend in ("fast", "deep") else SYSTEM1_MODE
-    result: dict[str, Any] = {}
+    t0 = time.monotonic()
 
-    if mode in ("fast", "auto"):
-        t0 = time.monotonic()
-        try:
-            raw = _call_jev(LAYA_URL, text, _LAYA_QUESTIONS, timeout=10.0)
-            elapsed = round((time.monotonic() - t0) * 1000, 1)
-            result = _parse_laya_result(raw)
-            result["backend"] = "laya"
-            result["engine"] = "laya-system1"
-            result["latency_ms"] = elapsed
-            _log.info("Laya classified %r → %s (%.1f%% in %.0fms)",
-                       text[:60], result["data_classification"],
-                       result["confidence"] * 100, elapsed)
-        except Exception as exc:
-            _log.warning("Laya call failed (%s), falling back to deep", exc)
-            mode = "deep"
+    try:
+        resp = httpx.post(
+            f"{LAYA_URL}/v1/systemone",
+            json={
+                "state": {"record": record_text},
+                "questions": COMPLIANCE_QUESTIONS,
+            },
+            timeout=10.0,
+            verify=False,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        _log.error("Laya /v1/systemone call failed: %s", exc)
+        return {
+            "error": str(exc),
+            "backend": "laya",
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+        }
 
-    if mode == "deep" or (
-        mode == "auto"
-        and result.get("confidence", 0) < CONFIDENCE_THRESHOLD
-    ):
-        escalation_reason = None
-        if mode == "auto" and result:
-            escalation_reason = (
-                f"Laya confidence {result['confidence']:.2f} < "
-                f"threshold {CONFIDENCE_THRESHOLD:.2f}"
-            )
-            _log.info("Auto-escalating to DiffusionGemma: %s", escalation_reason)
+    elapsed = round((time.monotonic() - t0) * 1000, 1)
+    raw = resp.json()
+    answers = raw.get("answers", {})
 
-        t0 = time.monotonic()
-        try:
-            raw = _call_jev(
-                DIFFUSIONGEMMA_URL, text, _DIFFUSIONGEMMA_QUESTIONS,
-                timeout=120.0,
-            )
-            elapsed = round((time.monotonic() - t0) * 1000, 1)
-            deep = _parse_diffusiongemma_result(raw)
-            deep["backend"] = "diffusiongemma"
-            deep["engine"] = "diffusiongemma-26b-h200"
-            deep["latency_ms"] = elapsed
-            _log.info("DiffusionGemma classified %r → %s (%.1f%% in %.0fms)",
-                       text[:60], deep["data_classification"],
-                       deep["confidence"] * 100, elapsed)
+    # ── Parse each typed answer ──────────────────────────────────
+    data_type = answers.get("data_type", {})
+    pii = answers.get("pii_detected", {})
+    regime = answers.get("data_subject_location", {})
+    sensitivity = answers.get("sensitivity", {})
+    review = answers.get("needs_human_review", {})
 
-            if result:
-                result["deep_result"] = deep
-                result["escalation_reason"] = escalation_reason
-            else:
-                result = deep
-        except Exception as exc:
-            _log.warning("DiffusionGemma call failed: %s", exc)
-            if not result:
-                return {
-                    "error": f"Both backends failed. DiffusionGemma: {exc}",
-                    "backend": "none",
-                }
+    data_type_choice = data_type.get("choice", "unknown")
+    data_type_probs = data_type.get("probabilities", {})
+    data_type_conf = data_type.get("answer_confidence",
+                                   max(data_type_probs.values())
+                                   if data_type_probs else 0.0)
 
-    return result
+    location_choice = regime.get("choice", "other")
+    location_probs = regime.get("probabilities", {})
+
+    sensitivity_score = sensitivity.get("score", 0.0)
+    sensitivity_legend = sensitivity.get("legend", [])
+
+    pii_prob = pii.get("noul", 0.0)
+    review_prob = review.get("noul", 0.0)
+
+    _log.info(
+        "Laya: data_type=%s (conf=%.2f), pii=%.2f, location=%s, "
+        "sensitivity=%.1f, review=%.2f in %.0fms",
+        data_type_choice, data_type_conf, pii_prob, location_choice,
+        sensitivity_score, review_prob, elapsed,
+    )
+
+    return {
+        # ── The five typed answers ───────────────────────────────
+        "data_type": data_type_choice,
+        "data_type_confidence": round(data_type_conf, 4),
+        "data_type_probabilities": data_type_probs,
+        "pii_detected": round(pii_prob, 4),
+        "data_subject_location": location_choice,
+        "data_subject_location_probabilities": location_probs,
+        "sensitivity_score": round(sensitivity_score, 2),
+        "sensitivity_legend": sensitivity_legend,
+        "needs_human_review": round(review_prob, 4),
+        # ── Metadata ─────────────────────────────────────────────
+        "backend": "laya",
+        "latency_ms": elapsed,
+        "questions_answered": 5,
+        "output_tokens": 0,
+        "usage": raw.get("usage", {}),
+    }

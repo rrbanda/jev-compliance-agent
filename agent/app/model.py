@@ -1,8 +1,8 @@
 """Shared LLM model configuration for all agents.
 
-Uses Gemini via the Google AI API as the System 2 reasoning LLM.  This
-frees all on-cluster GPUs for inference workloads (Laya, DiffusionGemma)
-and gives the agent a stronger reasoning model than a local 7B.
+Uses Gemini via the Google AI API as the System 2 reasoning LLM.
+Laya handles the System 1 classification (on-cluster, zero output
+tokens) and Gemini reasons about the decisions.
 
 Configure via environment variables (see .env.example):
   GOOGLE_API_KEY   — Gemini API key (required)
@@ -20,9 +20,9 @@ def get_model() -> Gemini:
     """Returns a Gemini model instance for the agent.
 
     The API key is read from the GOOGLE_API_KEY environment variable.
-    This is the System 2 (slow, deliberative) half of the pipeline —
-    it reasons about the routing decision after the System 1 engines
-    (Laya / DiffusionGemma) have provided their classifications.
+    This is the System 2 (deliberative) half of the pipeline — it
+    reasons about routing decisions after Laya's System 1 classification
+    has provided calibrated probabilities.
     """
     model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
     return Gemini(model=model_name)

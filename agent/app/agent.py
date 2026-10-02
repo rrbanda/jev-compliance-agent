@@ -14,10 +14,14 @@
 
 """Cross-border data-policy router — orchestrator and root agent definition.
 
-Evaluates a data-processing request against a registry of regional Agent
-Cards (`app/policy/cards.py`) using a data-residency/jurisdiction policy
-engine (`app/policy/engine.py`), then delegates to whichever regional
-processor sub-agent the policy approved.
+Three-tier pipeline:
+  1. Laya (System 1): one Jev /v1/systemone call, five typed questions,
+     one forward pass, zero output tokens, ~145ms.
+  2. Application policy: deterministic rules that map Laya's calibrated
+     probabilities to routing requirements (residency, exclusions, human
+     review flags).
+  3. Gemini (System 2): reasons about the decision, explains it to the
+     user, and routes to the correct regional sub-agent.
 """
 
 from google.adk.agents import Agent
@@ -30,6 +34,7 @@ from .sub_agents.eu_processor.agent import eu_processor_agent
 from .sub_agents.uk_processor.agent import uk_processor_agent
 from .sub_agents.us_processor.agent import us_processor_agent
 from .tools.laya_tool import classify_with_laya
+from .tools.compliance_policy import apply_compliance_policy
 from .tools.routing_tool import evaluate_and_route
 
 
@@ -40,12 +45,14 @@ def create_agent() -> Agent:
         model=get_model(),
         description=(
             "Routes data-processing requests to a jurisdiction-compliant "
-            "regional agent by evaluating cross-border data-residency "
-            "policy against each candidate agent's Agent Card."
+            "regional agent.  Uses Laya (System 1) for instant neural "
+            "classification, an application policy for deterministic "
+            "compliance rules, and Gemini (System 2) for reasoning."
         ),
         instruction=ORCHESTRATOR_INSTRUCTION,
         tools=[
             classify_with_laya,
+            apply_compliance_policy,
             evaluate_and_route,
             AgentTool(agent=eu_processor_agent),
             AgentTool(agent=uk_processor_agent),
