@@ -14,12 +14,13 @@
 
 """Cross-border data-policy router — orchestrator and root agent definition.
 
-Three-tier pipeline:
-  1. Laya (System 1): one Jev /v1/systemone call, five typed questions,
-     one forward pass, zero output tokens, ~145ms.
-  2. Application policy: deterministic rules that map Laya's calibrated
-     probabilities to routing requirements (residency, exclusions, human
-     review flags).
+Pipeline with confidence gating:
+  1. Laya (System 1, fast): one Jev /v1/systemone call, five typed
+     questions, ~150ms.  If confidence is low, DiffusionGemma 26B is
+     called automatically with the same questions for a deeper read.
+  2. Application policy: deterministic rules that map calibrated
+     probabilities to routing requirements (residency, exclusions,
+     human review flags).
   3. Gemini (System 2): reasons about the decision, explains it to the
      user, and routes to the correct regional sub-agent.
 """
@@ -45,9 +46,9 @@ def create_agent() -> Agent:
         model=get_model(),
         description=(
             "Routes data-processing requests to a jurisdiction-compliant "
-            "regional agent.  Uses Laya (System 1) for instant neural "
-            "classification, an application policy for deterministic "
-            "compliance rules, and Gemini (System 2) for reasoning."
+            "regional agent.  Uses Laya (fast) and DiffusionGemma (deep) "
+            "as Jev decision models with confidence gating, an application "
+            "policy for deterministic compliance rules, and Gemini for reasoning."
         ),
         instruction=ORCHESTRATOR_INSTRUCTION,
         tools=[

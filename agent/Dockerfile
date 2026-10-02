@@ -1,5 +1,6 @@
 # Cross-Border Data Router Agent
-# Laya (System 1: 5 typed questions, 1 forward pass) + Gemini (System 2)
+# Laya 421M (fast, ~150ms) + DiffusionGemma 26B (deep, confidence gated)
+# + Gemini (System 2 reasoning)
 #
 # Build:
 #   podman build -t cross-border-data-router:latest agent/
@@ -8,6 +9,7 @@
 #   podman run --rm -p 8080:8080 \
 #     -e GOOGLE_API_KEY=<your-gemini-key> \
 #     -e LAYA_API_URL=https://laya-api-gpu-laya-demo.apps.ocp... \
+#     -e DIFFUSIONGEMMA_API_URL=https://dgemma-jev-... \
 #     cross-border-data-router:latest
 
 FROM registry.access.redhat.com/ubi9/python-312:latest

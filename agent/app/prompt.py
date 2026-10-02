@@ -29,8 +29,16 @@ IMPORTANT: use the EXACT tool and parameter names.
 
 Call classify_with_laya with the text of the data record.
 
-This makes ONE Jev call that answers FIVE typed questions in a single
-forward pass (~145ms, zero output tokens — Laya does not generate text):
+This calls TWO Jev decision models that speak the same /v1/systemone
+protocol.  Both answer the SAME five typed questions and return
+calibrated probability distributions, not generated text:
+
+  Laya (421M encoder)  — runs first, ~150ms, zero output tokens.
+  DiffusionGemma (26B) — called automatically IF Laya's confidence on
+      data_type or data_subject_location falls below the gate (0.55).
+      Takes ~10-26s but gives a deeper read.
+
+The five questions answered in a single forward pass:
 
   data_type               (choice)  PII / financial / health / public
   pii_detected            (noul)    probability the record contains PII
@@ -38,8 +46,16 @@ forward pass (~145ms, zero output tokens — Laya does not generate text):
   sensitivity             (score)   0=public to 3=restricted
   needs_human_review      (noul)    probability a human should review
 
-Every answer comes with calibrated probabilities — when Laya says
+Every answer comes with calibrated probabilities — when the model says
 0.94, the true positive rate is approximately 94%.
+
+If DiffusionGemma was called, the result will include:
+  escalated_to_diffusiongemma = true
+  escalation_reason = why the gate triggered
+  laya_fast_result = Laya's original answers for comparison
+  backend = "laya+diffusiongemma"
+
+Report whether escalation happened in your response.
 
 ── STEP 2: apply_compliance_policy ──────────────────────────────────
 
