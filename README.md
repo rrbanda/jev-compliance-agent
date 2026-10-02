@@ -21,67 +21,55 @@ Neither provides **auditable probability distributions** that compliance teams n
 
 ## How It Works
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     User Request                             │
-│  "Route this: Maria Schmidt, Berlin, Tax ID 12/345/67890"   │
-└─────────────┬───────────────────────────────────────────────┘
-              │
-  Step 1a     ▼   ONE Jev-compatible call, FIVE typed questions
-┌─────────────────────────────────────────────────────────────┐
-│              Laya (System 1 — fast)                           │
-│  421M encoder · ~150ms · 0 output tokens · non-autoregressive│
-│                                                              │
-│  data_type           choice → financial (0.70)               │
-│  pii_detected        noul   → 0.33                           │
-│  data_subject_location choice → EU (0.51)                    │
-│  sensitivity         score  → 1.72 / 3                       │
-│  needs_human_review  noul   → 0.17                           │
-└─────────────┬───────────────────────────────────────────────┘
-              │
-  Step 1b     ▼   Confidence gate (Example 18 pattern)
-              │   data_type_conf < 0.55 OR location_conf < 0.55?
-              │
-        ┌─────┴─────┐
-    YES │           │ NO → skip to Step 2
-        ▼           │
-┌───────────────┐   │
-│ DiffusionGemma│   │
-│ (System 1 —   │   │
-│  deep)        │   │
-│ 26B · ~1s     │   │
-│ same 5 Qs     │   │
-│ same protocol │   │
-│               │   │
-│ EU → 0.9999   │   │
-│ health → 0.99 │   │
-└───────┬───────┘   │
-        └─────┬─────┘
-              │
-     Step 2   ▼   Deterministic rules, tuneable thresholds
-┌─────────────────────────────────────────────────────────────┐
-│               Application Policy                             │
-│                                                              │
-│  PII override:  pii_detected=0.33 < 0.70 → no override      │
-│  Regime table:  EU + financial → GDPR                        │
-│  Residency:     EU/EEA required                              │
-│  Excluded:      CHINA, RUSSIA                                │
-│  Human review:  not needed (all signals clear)               │
-└─────────────┬───────────────────────────────────────────────┘
-              │
-     Step 3   ▼   A2A Agent Cards + OpenEAGO geographic metadata
-┌─────────────────────────────────────────────────────────────┐
-│               Routing Engine                                 │
-│  Residency filter → Exclusion filter → Score → EU Agent ✓   │
-└─────────────┬───────────────────────────────────────────────┘
-              │
-     Step 4   ▼   Gemini reasons about the whole pipeline
-┌─────────────────────────────────────────────────────────────┐
-│               Gemini 2.5 Flash (System 2)                    │
-│  Explains: "Classified as financial data for an EU subject.  │
-│  GDPR applies. Routed to EU Agent (Frankfurt). No human      │
-│  review needed — all confidence thresholds met."             │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    REQ(["📨 User Request"])
+
+    subgraph SYS1 [" 🧠 System 1 · Jev-compatible Decision Models "]
+        direction TB
+        LAYA["🟢 Laya 421M\n~150ms · 0 output tokens\n─────────────────────\ndata_type → financial 0.70\npii_detected → 0.33\nlocation → EU 0.51 ⚠️\nsensitivity → 1.72\nneeds_review → 0.17"]
+        GATE{{"🚦 Confidence Gate\nanswer_confidence < 0.55 ?"}}
+        DGEMMA["🟣 DiffusionGemma 26B\n~1s · same 5 questions\nsame /v1/systemone protocol\n─────────────────────\nlocation → EU 0.9999 ✅\ndata_type → health 0.99 ✅"]
+        SKIP(["✅ Use Laya answers"])
+
+        LAYA --> GATE
+        GATE -- "⚠️ Low confidence" --> DGEMMA
+        GATE -- "✅ Confident" --> SKIP
+    end
+
+    REQ --> LAYA
+    DGEMMA --> POLICY
+    SKIP --> POLICY
+
+    POLICY["⚖️ Application Policy\n─────────────────────\nPII override: pii ≥ 0.70 ?\nRegime table: location × type → law\nEU + financial → GDPR\nResidency: EU/EEA required\nExcluded: CHINA, RUSSIA"]
+    ROUTING["🗺️ Routing Engine\n─────────────────────\nA2A Agent Cards + OpenEAGO\nResidency → Exclusion → Score"]
+    GEMINI["💬 Gemini 2.5 Flash · System 2\n─────────────────────\nExplains the decision\nRoutes to regional sub-agent"]
+
+    POLICY --> ROUTING --> GEMINI
+
+    EU(["🇪🇺 EU Agent · Frankfurt"])
+    UK(["🇬🇧 UK Agent · London"])
+    US(["🇺🇸 US Agent · Virginia"])
+    REJECT(["🚫 Rejected"])
+
+    GEMINI --> EU
+    GEMINI --> UK
+    GEMINI --> US
+    GEMINI --> REJECT
+
+    style REQ fill:#e3f2fd,stroke:#1976d2,stroke-width:2px,color:#0d47a1
+    style LAYA fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#1b5e20
+    style GATE fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#e65100
+    style DGEMMA fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
+    style SKIP fill:#e8f5e9,stroke:#66bb6a,stroke-width:1px,color:#2e7d32
+    style POLICY fill:#fffde7,stroke:#f9a825,stroke-width:2px,color:#f57f17
+    style ROUTING fill:#e0f2f1,stroke:#00897b,stroke-width:2px,color:#004d40
+    style GEMINI fill:#fce4ec,stroke:#d81b60,stroke-width:2px,color:#880e4f
+    style EU fill:#e8eaf6,stroke:#5c6bc0,stroke-width:1px,color:#283593
+    style UK fill:#e8eaf6,stroke:#5c6bc0,stroke-width:1px,color:#283593
+    style US fill:#e8eaf6,stroke:#5c6bc0,stroke-width:1px,color:#283593
+    style REJECT fill:#ffebee,stroke:#e53935,stroke-width:1px,color:#b71c1c
+    style SYS1 fill:#f9fbe7,stroke:#9ccc65,stroke-width:2px,color:#33691e
 ```
 
 ## Two Jev-compatible Models, One Protocol
